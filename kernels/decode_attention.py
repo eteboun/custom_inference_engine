@@ -14,32 +14,45 @@ def decode_gqa_attention_kernel_load(
     Q, K, V,
     SEQ_LEN,
     partial_m, partial_l, partial_acc,
+    stride_kv_batch,
     stride_kv_head,
     D: tl.constexpr,
+    Q_HEADS: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_D: tl.constexpr,
     BLOCK_G: tl.constexpr,
     GROUP_SIZE: tl.constexpr
 ):
+    # Q: (B, H_q, D) contiguous
+    # KV: (B, H_kv, max_len, D). batch ve head adimlari host'tan stride olarak geliyor,
+    # head icinde satir adimi D. stride'lar siradan int: kapasite / batch boyutu
+    # degisince yeniden derleme yok. ofsetlerin int32'ye sigdigini host kontrol ediyor
+
     partition_idx = tl.program_id(0)
     kv_head_idx = tl.program_id(1)
+    batch_idx = tl.program_id(2)
     P = tl.num_programs(0)
 
-    # gecerli uzunluk runtime'da GPU'dan okunuyor: her L icin yeniden derleme yok,
-    # CUDA graph replay'inde de her adimda guncel deger okunur.
-    # K/V buffer'i L'den uzun olabilir (KV cache kapasitesi), head adimi ayri veriliyor
-    L = tl.load(SEQ_LEN).to(tl.int32)
+    L = tl.load(
+        SEQ_LEN + batch_idx
+    ).to(tl.int32)
 
-    cols = tl.arange(0, BLOCK_D)
-    row_offsets = tl.arange(0, BLOCK_N)
+    qkv_cols = tl.arange(0, BLOCK_D)
+    qkv_col_offsets = qkv_cols[None, :]
+    qkv_col_mask = qkv_cols[None, :] < D
 
-    k_ptr = K + kv_head_idx * stride_kv_head
-    v_ptr = V + kv_head_idx * stride_kv_head
+    q_heads = tl.arange(0, BLOCK_G)
+    q_batch_offsets = batch_idx * Q_HEADS * D
+    q_head_offsets = (kv_head_idx * GROUP_SIZE + q_heads)[:, None] * D
+    q_head_mask = q_heads[:, None] < GROUP_SIZE
 
-    q_rows = tl.arange(0, BLOCK_G)
+    # (BLOCK_G, BLOCK_D)
     q = tl.load(
-        Q + (kv_head_idx * GROUP_SIZE + q_rows[:, None]) * D + cols[None, :],
-        mask=(q_rows[:, None] < GROUP_SIZE) & (cols[None, :] < D),
+        Q + q_batch_offsets
+        + q_head_offsets
+        + qkv_col_offsets,
+        mask=q_head_mask
+        & qkv_col_mask,
         other=0
     )
 
@@ -47,36 +60,52 @@ def decode_gqa_attention_kernel_load(
     ls_old = tl.full((BLOCK_G,), 0.0, tl.float32)
     accs_old = tl.full((BLOCK_G, BLOCK_D), 0.0, tl.float32)
 
+    kv_rows = tl.arange(0, BLOCK_N)
+    kv_batch_offsets = batch_idx * stride_kv_batch
+    kv_head_offsets = kv_head_idx * stride_kv_head
+
     for start in range(
         partition_idx * BLOCK_N,
         L,
         P * BLOCK_N
     ):
-        rows = start + row_offsets
+        rows = start + kv_rows
 
-        offsets = rows[:, None] * D + cols[None, :]
-        mask = (rows[:, None] < L) & (cols[None, :] < D)
+        kv_row_offsets = rows[:, None] * D
+        kv_row_mask = rows[:, None] < L
 
+        # (BLOCK_N, BLOCK_D)
         k = tl.load(
-            k_ptr + offsets,
-            mask=mask,
+            K + kv_batch_offsets
+            + kv_head_offsets
+            + kv_row_offsets
+            + qkv_col_offsets,
+            mask=kv_row_mask
+            & qkv_col_mask,
             other=0
         )
 
+        # (BLOCK_N, BLOCK_D)
         v = tl.load(
-            v_ptr + offsets,
-            mask=mask,
+            V + kv_batch_offsets
+            + kv_head_offsets
+            + kv_row_offsets
+            + qkv_col_offsets,
+            mask=kv_row_mask
+            & qkv_col_mask,
             other=0
         )
 
+        # (BLOCK_G, BLOCK_N)
         scores = tl.dot(
             q,
             tl.trans(k)
         )
 
+        # (BLOCK_G, BLOCK_N)
         norm_scores = tl.where(
             (rows[None, :] < L)
-            & (q_rows[:, None] < GROUP_SIZE),
+            & q_head_mask,
             scores * (D ** -0.5),
             -float("inf")
         )
@@ -97,26 +126,42 @@ def decode_gqa_attention_kernel_load(
 
         ms_old = ms_new
 
-    indices = (kv_head_idx * GROUP_SIZE + q_rows) * P
-    offset = partition_idx
+    # partial_m, partial_l: (B, H_q, P)
+    # partial_acc: (B, H_q, P, D)
+
+    ml_batch_offsets = batch_idx * Q_HEADS * P
+    ml_head_offsets = (kv_head_idx * GROUP_SIZE + q_heads) * P
+    ml_partition_offsets = partition_idx
+    ml_head_mask = q_heads < GROUP_SIZE
 
     tl.store(
-        partial_m + indices + offset,
-        ms_old, mask=q_rows < GROUP_SIZE
+        partial_m + ml_batch_offsets
+        + ml_head_offsets
+        + ml_partition_offsets,
+        ms_old,
+        mask=ml_head_mask
     )
 
     tl.store(
-        partial_l + indices + offset,
-        ls_old, mask=q_rows < GROUP_SIZE
+        partial_l + ml_batch_offsets
+        + ml_head_offsets
+        + ml_partition_offsets,
+        ls_old,
+        mask=ml_head_mask
     )
 
-    indices = kv_head_idx * GROUP_SIZE * P * D + q_rows * P * D
-    offset = partition_idx * D
+    acc_batch_offsets = batch_idx * Q_HEADS * P * D
+    acc_head_offsets = (kv_head_idx * GROUP_SIZE + q_heads)[:, None] * P * D
+    acc_partition_offsets = partition_idx * D
 
     tl.store(
-        partial_acc + indices[:, None] + offset + cols[None, :],
+        partial_acc + acc_batch_offsets
+        + acc_head_offsets
+        + acc_partition_offsets
+        + qkv_col_offsets,
         accs_old,
-        mask=(q_rows[:, None] < GROUP_SIZE) & (cols[None, :] < D)
+        mask=q_head_mask
+        & qkv_col_mask
     )
 
 
@@ -126,59 +171,88 @@ def decode_attention_kernel_merge(
     partial_m, partial_l, partial_acc,
     P: tl.constexpr,
     D: tl.constexpr,
+    Q_HEADS: tl.constexpr,
     BLOCK_P: tl.constexpr,
     BLOCK_D: tl.constexpr,
 ):
-    head_idx = tl.program_id(0)
+    # O: (B, H_q, D)
+    # partial_m, partial_l: (B, H_q, P)
+    # partial_acc: (B, H_q, P, D)
 
-    ps = tl.arange(0, BLOCK_P)
+    head_idx = tl.program_id(0)
+    batch_idx = tl.program_id(1)
+
+    partitions = tl.arange(0, BLOCK_P)
+
     cols = tl.arange(0, BLOCK_D)
 
-    # Head baslangic adresleri
-    partial_idx = head_idx * P
+    ml_batch_offsets = batch_idx * Q_HEADS * P
+    ml_head_offsets = head_idx * P
+    ml_partition_mask = partitions < P
 
-    m_ptr = partial_m + partial_idx
-    l_ptr = partial_l + partial_idx
-    acc_ptr = partial_acc + partial_idx * D
-    o_ptr = O + head_idx * D
-
-    # Partial sonuclari yukle
-    valid_ps = ps < P
-    valid_cols = cols < D
-
+    # (BLOCK_P,)
     ms = tl.load(
-        m_ptr + ps,
-        mask=valid_ps,
+        partial_m + ml_batch_offsets
+        + ml_head_offsets
+        + partitions,
+        mask=ml_partition_mask,
         other=-float("inf")
     )
 
+    # (BLOCK_P,)
     ls = tl.load(
-        l_ptr + ps,
-        mask=valid_ps,
-        other=0
+        partial_l + ml_batch_offsets
+        + ml_head_offsets
+        + partitions,
+        mask=ml_partition_mask,
+        other=0.0
     )
 
-    offsets = ps[:, None] * D + cols[None, :]
-    mask = valid_ps[:, None] & valid_cols[None, :]
+    acc_batch_offsets = batch_idx * Q_HEADS * P * D
+    acc_head_offsets = head_idx * P * D
+    acc_partition_offsets = partitions[:, None] * D
+    acc_col_offsets = cols[None, :]
+    acc_partition_mask = partitions[:, None] < P
+    acc_col_mask = cols[None, :] < D
 
+    # (BLOCK_P, BLOCK_D)
     accs = tl.load(
-        acc_ptr + offsets,
-        mask=mask,
-        other=0
+        partial_acc + acc_batch_offsets
+        + acc_head_offsets
+        + acc_partition_offsets
+        + acc_col_offsets,
+        mask=acc_partition_mask
+        & acc_col_mask,
+        other=0.0
     )
 
-    # Partial softmax sonuclarini birlestir
     max_m = tl.max(ms, axis=0)
 
+    # (BLOCK_P,)
     alpha = tl.exp(ms - max_m)
+
     denominator = tl.sum(ls * alpha, axis=0)
 
+    # (BLOCK_P, BLOCK_D)
     weighted_accs = accs * alpha[:, None]
+
+    # (BLOCK_D,)
     numerator = tl.sum(weighted_accs, axis=0)
 
-    # Nihai attention ciktisi
-    tl.store(
-        o_ptr + cols,
+    o_batch_offset = batch_idx * Q_HEADS * D
+    o_head_offsets = head_idx * D
+    o_cols_mask = cols < D
+
+    output = tl.where(
+        max_m > -float("inf"),
         numerator / denominator,
-        mask=valid_cols
+        0.0
+    )
+
+    tl.store(
+        O + o_batch_offset
+        + o_head_offsets
+        + cols,
+        output,
+        mask=o_cols_mask
     )

@@ -22,9 +22,9 @@ if __name__ == "__main__":
     k = torch.randn((H_KV, L, D), device="cuda", dtype=torch.float16)
     v = torch.randn((H_KV, L, D), device="cuda", dtype=torch.float16)
 
-    seq_len = torch.tensor(L, device="cuda", dtype=torch.int32)
+    seq_len = torch.tensor([L], device="cuda", dtype=torch.int32)
 
     for _ in range(WARMUP + 1):
-        o = decode_gqa_attention(q, k, v, seq_len, BLOCK_N=BLOCK_N, num_programs=P)
+        o = decode_gqa_attention(q[None], k[None], v[None], seq_len, BLOCK_N=BLOCK_N, num_programs=P)
     torch.cuda.synchronize()
     print(f"L={L} BLOCK_N={BLOCK_N} P={P} out={tuple(o.shape)}")

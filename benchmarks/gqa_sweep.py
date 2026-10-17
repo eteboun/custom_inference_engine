@@ -72,18 +72,19 @@ def make_triton(L, data, BLOCK_N, num_warps, P):
     seq_len = torch.tensor(L, device="cuda", dtype=torch.int32)
 
     def run(i):
-        decode_gqa_attention_kernel_load[(P, H_KV)](
+        # kernel batch'li, burada B = 1 (grid'in 3. boyutu 1, batch adımı kullanılmıyor)
+        decode_gqa_attention_kernel_load[(P, H_KV, 1)](
             qs[i], ks[i], vs[i],
             seq_len,
             partial_m, partial_l, partial_acc,
-            ks.stride(1),
-            D=D, BLOCK_N=BLOCK_N, BLOCK_D=BLOCK_D,
+            ks.stride(0), ks.stride(1),
+            D=D, Q_HEADS=H_Q, BLOCK_N=BLOCK_N, BLOCK_D=BLOCK_D,
             BLOCK_G=BLOCK_G, GROUP_SIZE=GROUP_SIZE,
             num_warps=num_warps,
         )
-        decode_attention_kernel_merge[(H_Q,)](
+        decode_attention_kernel_merge[(H_Q, 1)](
             o, partial_m, partial_l, partial_acc,
-            P=P, D=D, BLOCK_P=triton.next_power_of_2(P), BLOCK_D=BLOCK_D,
+            P=P, D=D, Q_HEADS=H_Q, BLOCK_P=triton.next_power_of_2(P), BLOCK_D=BLOCK_D,
         )
         return o
 

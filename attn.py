@@ -23,18 +23,26 @@ def default_num_programs(L, BLOCK_N):
 
 def decode_gqa_attention(q, k, v, seq_len, BLOCK_N=64, num_programs=None, num_warps=4,
                          wrap=lambda kernel: kernel):
-    # GQA, tek query token: q (H_q, D), k/v (H_kv, max_len, D), son boyut contiguous
-    # seq_len: GPU'da tek elemanlı int tensor, geçerli uzunluk (<= max_len, cache kapasitesi). kernel bunu
-    # runtime'da okur, yani K/V buffer'ının sadece ilk seq_len satırı kullanılır
+    # GQA, batch'teki her dizi için tek query token:
+    # q (B, H_q, D) contiguous, k/v (B, H_kv, max_len, D), head içinde satırlar bitişik
+    # (batch ve head adımı stride olarak kernel'e gider)
+    # seq_len: GPU'da (B,) int tensor, dizi başına geçerli uzunluk (<= max_len, cache
+    # kapasitesi). kernel bunu runtime'da okur, K/V'nin sadece ilk seq_len satırı kullanılır
     # q head h, kv head h // (H_q // H_kv)'yi okur
-    # load grid (P, H_kv): her program bir kv head'in K/V bloklarını bir kez okur,
-    # o kv head'i paylaşan GROUP_SIZE q head'i birlikte işler (BLOCK_G satıra pad'li)
-    # merge grid (H_q,), ara sonuçlar q head başına
+    # load grid (P, H_kv, B): her program bir dizinin bir kv head'inin K/V bloklarını bir
+    # kez okur, o kv head'i paylaşan GROUP_SIZE q head'i birlikte işler (BLOCK_G satıra pad'li)
+    # merge grid (H_q, B): her program bir dizinin bir q head'inin P parçasını birleştirir,
+    # ara sonuçlar (B, H_q, P[, D]) düzeninde
     # wrap: custom op içinde wrap_triton, torch.compile kernel çağrılarını böyle görüyor
-    H_q, D = q.shape
-    H_kv, max_len, _ = k.shape
+    B, H_q, D = q.shape
+    _, H_kv, max_len, _ = k.shape
     assert H_q % H_kv == 0
-    assert k.stride() == v.stride() and k.stride(2) == 1 and k.stride(1) == D
+    assert k.shape[0] == B and seq_len.shape == (B,)
+    assert q.is_contiguous()
+    assert k.stride() == v.stride() and k.stride(3) == 1 and k.stride(2) == D
+    # kernel ofsetleri int32 hesaplıyor: K/V'de erişilen en büyük ofset sığmalı
+    max_kv_offset = (B - 1) * k.stride(0) + (H_kv - 1) * k.stride(1) + max_len * D
+    assert max_kv_offset < 2**31, "K/V ofsetleri int32'ye sığmıyor"
     # tl.dot her boyutun en az 16 olmasını istiyor: q (BLOCK_G, D) @ k^T (D, BLOCK_N)
     # ve p (BLOCK_G, BLOCK_N) @ v (BLOCK_N, D)
     assert BLOCK_N >= 16, "tl.dot için BLOCK_N >= 16 olmalı"
@@ -42,17 +50,20 @@ def decode_gqa_attention(q, k, v, seq_len, BLOCK_N=64, num_programs=None, num_wa
     BLOCK_D = triton.next_power_of_2(D)
     BLOCK_G = max(16, triton.next_power_of_2(H_q // H_kv))
 
-    partial_m = torch.empty((H_q, P), device=q.device, dtype=torch.float32)
-    partial_l = torch.empty((H_q, P), device=q.device, dtype=torch.float32)
-    partial_acc = torch.empty((H_q, P, D), device=q.device, dtype=torch.float32)
+    partial_m = torch.empty((B, H_q, P), device=q.device, dtype=torch.float32)
+    partial_l = torch.empty((B, H_q, P), device=q.device, dtype=torch.float32)
+    partial_acc = torch.empty((B, H_q, P, D), device=q.device, dtype=torch.float32)
+    assert partial_acc.numel() < 2**31, "ara sonuç ofsetleri int32'ye sığmıyor"
     o = torch.empty_like(q)
 
-    wrap(decode_gqa_attention_kernel_load)[(P, H_kv)](
+    wrap(decode_gqa_attention_kernel_load)[(P, H_kv, B)](
         q, k, v,
         seq_len,
         partial_m, partial_l, partial_acc,
         k.stride(0),
+        k.stride(1),
         D=D,
+        Q_HEADS=H_q,
         BLOCK_N=BLOCK_N,
         BLOCK_D=BLOCK_D,
         BLOCK_G=BLOCK_G,
@@ -60,11 +71,12 @@ def decode_gqa_attention(q, k, v, seq_len, BLOCK_N=64, num_programs=None, num_wa
         num_warps=num_warps,
     )
 
-    wrap(decode_attention_kernel_merge)[(H_q,)](
+    wrap(decode_attention_kernel_merge)[(H_q, B)](
         o,
         partial_m, partial_l, partial_acc,
         P=P,
         D=D,
+        Q_HEADS=H_q,
         BLOCK_P=triton.next_power_of_2(P),
         BLOCK_D=BLOCK_D,
     )
@@ -214,10 +226,11 @@ class TritonQwen2Attention(torch.nn.Module):
 
         if T == 1:
             # update start'ı ilerletmiyor: yeni token start pozisyonunda, uzunluk start + 1
+            # kernel batch'li (B, ...) bekliyor, manager şimdilik tek dizi: B = 1
             o = gqa_decode_attention_op(
-                query_states.reshape(self.num_heads, self.head_dim),
-                kv_manager.keys[self.layer_idx],
-                kv_manager.values[self.layer_idx],
+                query_states.reshape(1, self.num_heads, self.head_dim),
+                kv_manager.keys[self.layer_idx][None],
+                kv_manager.values[self.layer_idx][None],
                 kv_manager.start + 1,
             )
         else:
