@@ -2,10 +2,10 @@
 # bağlanması: torch.compile için custom op, Qwen2Attention yerine geçen modül.
 # kernel'ler kernels/ altında, mikro benchmark'lar benchmarks/ altında
 import torch
+import torch.nn.functional as F
 from torch.library import triton_op, wrap_triton
 import triton
 
-from transformers.cache_utils import Cache, StaticLayer
 from transformers.models.qwen2.modeling_qwen2 import Qwen2Attention, apply_rotary_pos_emb
 
 from kernels.decode_attention import (
@@ -24,7 +24,7 @@ def default_num_programs(L, BLOCK_N):
 def decode_gqa_attention(q, k, v, seq_len, BLOCK_N=64, num_programs=None, num_warps=4,
                          wrap=lambda kernel: kernel):
     # GQA, tek query token: q (H_q, D), k/v (H_kv, max_len, D), son boyut contiguous
-    # seq_len: GPU'da tek elemanlı int tensor, geçerli uzunluk (<= max_len). kernel bunu
+    # seq_len: GPU'da tek elemanlı int tensor, geçerli uzunluk (<= max_len, cache kapasitesi). kernel bunu
     # runtime'da okur, yani K/V buffer'ının sadece ilk seq_len satırı kullanılır
     # q head h, kv head h // (H_q // H_kv)'yi okur
     # load grid (P, H_kv): her program bir kv head'in K/V bloklarını bir kez okur,
@@ -76,7 +76,7 @@ def prefill_gqa_attention(q, k, v, BLOCK_M=16, BLOCK_N=64, num_warps=4,
                           wrap=lambda kernel: kernel):
     # GQA, causal prefill (boş cache'ten, query pozisyonları 0..T-1):
     # q (T, H_q, D) token-major ve contiguous (RoPE sonrası q da bu düzende,
-    # q[0].transpose(0, 1) kopyasız verir). k/v (H_kv, max_len, D): StaticCache buffer'ı,
+    # q[0].transpose(0, 1) kopyasız verir). k/v (H_kv, max_len, D): KV cache buffer'ı,
     # update'ten sonra ilk T satırı dolu. o (T, H_q, D): view(T, H_q * D) kopyasız o_proj'a gider
     # kernel adresleri bu düzenlere göre sabit hesaplıyor, stride almıyor
     # grid (cdiv(T, BLOCK_M), H_kv): her program BLOCK_M token x GROUP_SIZE q head'i
@@ -142,15 +142,18 @@ def gqa_decode_attention_op(
 
 class TritonQwen2Attention(torch.nn.Module):
     # orijinal Qwen2Attention modülünün yerine geçer (replace_attention).
-    # decode adımında (tek token + StaticCache) q/k/v projeksiyonu, RoPE ve cache
-    # güncellemesi Qwen2Attention.forward ile aynı, attention Triton GQA kernel'iyle.
-    # geçerli uzunluk StaticCache katmanının GPU'daki cumulative_length tensor'ından
-    # okunur (update'ten sonra yeni token dahil), CUDA graph'ta da her adımda günceldir.
-    # attention_mask kullanılmıyor: tek query için causal mask "ilk seq_len pozisyon"
-    # demek, bu yüzden prompt'ta pad olmamalı (batch 1, pad'siz).
-    # prefill ve diğer durumlar orijinal modüle (sdpa) gider. prefill için Triton kernel'i
-    # var (prefill_gqa_attention) ama WSL'de sdpa'nın FlashAttention 2'sinden uzun
-    # prompt'larda yavaş (bkz. GQA_PREFILL_CONFIG)
+    # model forward'una kv_manager (kv_cache.KVCacheManager) verilince batch 1'de:
+    # q/k/v projeksiyonu (tek matmul) + RoPE, K/V manager'a yazılır (update, pozisyon
+    # manager.start'tan), sonra attention:
+    # - decode (tek token): Triton GQA kernel'i, geçerli uzunluk manager.start + 1
+    #   (GPU'da, yeni token dahil). CUDA graph'ta her replay'de günceldir
+    # - prefill (T > 1): sdpa, causal, sadece bu T token'ın K/V'si. cache boş olmalı
+    #   (start = 0, query pozisyonları 0..T-1); generate prefill'den önce reset ediyor.
+    #   prefill için Triton kernel'i de var (prefill_gqa_attention) ama WSL'de sdpa'nın
+    #   FlashAttention 2'sinden uzun prompt'larda yavaş (bkz. GQA_PREFILL_CONFIG)
+    # manager.advance çağırana ait (adım başına bir kez, bütün katmanlardan sonra).
+    # attention_mask kullanılmıyor (causal + pad'siz varsayılıyor), prompt'ta pad olmamalı.
+    # kv_manager verilmezse orijinal modüle (sdpa) gider
     def __init__(self, original_attn):
         super().__init__()
 
@@ -162,38 +165,69 @@ class TritonQwen2Attention(torch.nn.Module):
         # kernel D ** -0.5 ile ölçekliyor
         assert original_attn.scaling == self.head_dim ** -0.5
 
+        # q/k/v projeksiyonu tek matmul: ağırlıklar ve bias'lar alt alta
+        # (896 + 128 + 128 = 1152 satır). çıktı split ile kopyasız q/k/v view'larına
+        # bölünür. decode'da 3 gemv yerine 1: okunan ağırlık aynı, kernel sayısı az.
+        # orijinal q/k/v_proj kv_manager'sız yol için duruyor, ağırlıklar iki kopya
+        # (~2 MB / katman). fuse_qkv=False ayrı projeksiyonlarla çalışır (karşılaştırma için)
+        projs = [original_attn.q_proj, original_attn.k_proj, original_attn.v_proj]
+        assert all(p.bias is not None for p in projs)
+        self.qkv_sizes = [p.out_features for p in projs]
+        with torch.no_grad():
+            self.register_buffer(
+                "qkv_weight", torch.cat([p.weight for p in projs]), persistent=False
+            )
+            self.register_buffer(
+                "qkv_bias", torch.cat([p.bias for p in projs]), persistent=False
+            )
+        self.fuse_qkv = True
+
     def forward(self, hidden_states, position_embeddings, attention_mask,
-                past_key_values=None, **kwargs):
-        layer = (
-            past_key_values.layers[self.layer_idx]
-            if isinstance(past_key_values, Cache) else None
-        )
-        if hidden_states.shape[:2] != (1, 1) or not isinstance(layer, StaticLayer):
+                past_key_values=None, kv_manager=None, **kwargs):
+        if kv_manager is None or hidden_states.shape[0] != 1:
             return self.original(
                 hidden_states, position_embeddings, attention_mask,
                 past_key_values=past_key_values, **kwargs
             )
 
         attn = self.original
-        hidden_shape = (1, 1, -1, self.head_dim)
-        query_states = attn.q_proj(hidden_states).view(hidden_shape).transpose(1, 2)
-        key_states = attn.k_proj(hidden_states).view(hidden_shape).transpose(1, 2)
-        value_states = attn.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+        T = hidden_states.shape[1]
+        hidden_shape = (1, T, -1, self.head_dim)
+        if self.fuse_qkv:
+            q, k, v = torch.nn.functional.linear(
+                hidden_states, self.qkv_weight, self.qkv_bias
+            ).split(self.qkv_sizes, dim=-1)
+        else:
+            q, k, v = attn.q_proj(hidden_states), attn.k_proj(hidden_states), attn.v_proj(hidden_states)
+        query_states = q.view(hidden_shape).transpose(1, 2)
+        key_states = k.view(hidden_shape).transpose(1, 2)
+        value_states = v.view(hidden_shape).transpose(1, 2)
 
         cos, sin = position_embeddings
         query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
 
-        # keys/values: (1, H_kv, max_len, D), bütün StaticCache buffer'ı
-        keys, values = past_key_values.update(key_states, value_states, self.layer_idx)
-
-        o = gqa_decode_attention_op(
-            query_states.reshape(self.num_heads, self.head_dim),
-            keys[0],
-            values[0],
-            layer.cumulative_length,
+        # manager token sırasında (T, H_kv, D) bekliyor: key_states (1, H_kv, T, D)'nin
+        # transpose'u, kopyasız view
+        kv_manager.update(
+            self.layer_idx, key_states[0].transpose(0, 1), value_states[0].transpose(0, 1)
         )
 
-        attn_output = attn.o_proj(o.view(1, 1, self.num_heads * self.head_dim))
+        if T == 1:
+            # update start'ı ilerletmiyor: yeni token start pozisyonunda, uzunluk start + 1
+            o = gqa_decode_attention_op(
+                query_states.reshape(self.num_heads, self.head_dim),
+                kv_manager.keys[self.layer_idx],
+                kv_manager.values[self.layer_idx],
+                kv_manager.start + 1,
+            )
+        else:
+            # boş cache'ten prefill: geçmiş yok, attention sadece bu T token'ın K/V'si
+            # (cache'ten okumak yerine elimizdeki tensörler). (1, H_q, T, D) -> (1, T, H_q, D)
+            o = F.scaled_dot_product_attention(
+                query_states, key_states, value_states, is_causal=True, enable_gqa=True
+            ).transpose(1, 2)
+
+        attn_output = attn.o_proj(o.reshape(1, T, self.num_heads * self.head_dim))
         return attn_output, None
 
 

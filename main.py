@@ -6,18 +6,18 @@ import statistics
 import time
 
 import torch
-import torch._dynamo.config
 import torch.cuda.nvtx as nvtx
-from transformers import AutoTokenizer, AutoModelForCausalLM, StaticCache
+from transformers import AutoTokenizer, AutoModelForCausalLM
 
 from attn import replace_attention
+from kv_cache.manager import KVCacheManager
 
 MODEL_ID = "Qwen/Qwen2.5-0.5B-Instruct"
 
-# inductor decode forward'u her cache uzunluğu için ayrı derleniyor (dynamic=False),
-# hepsi aynı _forward'un yeniden derlemesi sayılıyor. varsayılan sınır 8, benchmark'larda
-# uzunluk sayısı bunu aşabiliyor (FailOnRecompileLimitHit)
-torch._dynamo.config.recompile_limit = 64
+# KV cache kapasitesi (token): manager bir kez bu boyutta ayrılıyor, decode graph'ı tek
+# (her prompt uzunluğu aynı graph'ı kullanır, kernel geçerli uzunluğu GPU'dan okuyor).
+# Qwen2.5'in max_position_embeddings'i. fp16'da 24 katman x K+V: ~12 KB/token, ~400 MB
+KV_CACHE_CAPACITY = 32768
 
 
 def get_eos_token_ids(model, tokenizer):
@@ -41,7 +41,7 @@ def tokenize(tokenizer, messages, device):
 
 # manuel decode: torch.compile(inductor) ile derlenmiş forward, attention attn.py'deki
 # Triton GQA kernel'i (custom op olarak), hepsi tek CUDA graph.
-# prefill eager, attention sdpa.
+# prefill eager, attention sdpa. KV cache: kv_cache.KVCacheManager.
 # vllm karşılaştırma ve doğruluk referansı (sadece Linux/WSL'de kurulu)
 IMPL_LABELS = {
     "vllm": "vLLM (LLMEngine, varsayılan ayarlar)",
@@ -49,15 +49,15 @@ IMPL_LABELS = {
 }
 
 # vLLM'in model için ayırabileceği GPU belleği oranı (ağırlıklar + KV cache + graph'lar).
-# aynı GPU'da bizim model ve StaticCache'lerimiz de duruyor, varsayılan 0.92 sığmıyor
+# aynı GPU'da bizim model ve KV cache'lerimiz de duruyor, varsayılan 0.92 sığmıyor
 VLLM_GPU_MEMORY_UTILIZATION = 0.4
 
 
 def use_triton_attention(model):
     # modelin Qwen2Attention'larını kalıcı olarak TritonQwen2Attention ile değiştirir
-    # (ilk çağrıda, sonra no-op). Triton yolu sadece tek token + StaticCache'te (decode)
-    # çalışıyor, prefill ve diğer durumlarda orijinal modüle (sdpa) gidiyor.
-    # eskiden context manager'dı (hf generate aynı modeli orijinal attention'la
+    # (ilk çağrıda, sonra no-op). forward'a kv_manager verilince K/V'yi manager'a yazar,
+    # decode'da Triton kernel'i, prefill'de sdpa kullanır; kv_manager'sız orijinal modüle
+    # gider. eskiden context manager'dı (hf generate aynı modeli orijinal attention'la
     # kullanıyordu), artık modeli başka kullanan yok
     if not getattr(model, "_uses_triton_attention", False):
         replace_attention(model)
@@ -66,7 +66,8 @@ def use_triton_attention(model):
 
 class DecodeGraph:
     # tek token'lık decode forward'unu bir kez CUDA graph olarak kaydeder,
-    # sonraki generate çağrılarında aynı buffer'lar ve cache ile tekrar kullanılır
+    # sonraki generate çağrılarında aynı buffer'lar ve cache ile tekrar kullanılır.
+    # cache max_len kapasiteli, max_len'e kadar her prompt uzunluğu bu graph'la çalışır
 
     def __init__(self, model, max_len, warmup_iters=3):
         self.model = model
@@ -79,31 +80,20 @@ class DecodeGraph:
             self.static_position_ids = torch.zeros(
                 (1, 1), device=device, dtype=torch.long
             )
-            self.static_causal_mask = torch.full(
-                (1, 1, 1, max_len),
-                float("-inf"),
-                device=device,
-                dtype=model.dtype
-            )
-            self.kv_cache = StaticCache(
-                config=model.config,
-                max_cache_len=max_len
+            # buffer'lar burada bir kez ayrılıyor, adresleri sabit (graph bunları kaydediyor)
+            self.kv_cache = KVCacheManager(
+                model.config, max_len, device, model.dtype
             )
 
             # attention'lar Triton'a çevrilmiş olmalı (use_triton_attention):
             # graph capture sırasında çalışan kernel'leri kaydeder
             use_triton_attention(model)
 
-            # capture'dan önce yan stream'de warmup: StaticCache'in lazy init'i,
-            # cuBLAS workspace, triton JIT, inductor derlemesi gibi ilk
-            # çalıştırmada olan işler capture'a girmesin
-            self.static_causal_mask[..., 0] = 0
+            # capture'dan önce yan stream'de warmup: cuBLAS workspace, triton JIT,
+            # inductor derlemesi gibi ilk çalıştırmada olan işler capture'a girmesin
             side_stream = torch.cuda.Stream()
             side_stream.wait_stream(torch.cuda.current_stream())
             with torch.cuda.stream(side_stream):
-                # ilk forward eager: StaticCache tensor'larını ayırır. derleme
-                # init'ten sonra olursa her uzunluk için tek derleme yeter,
-                # yoksa init öncesi/sonrası için iki ayrı derleme olur
                 self.kv_cache.reset()
                 self._forward()
 
@@ -123,14 +113,18 @@ class DecodeGraph:
                 self.static_logits = forward().logits
 
     def _forward(self):
-        return self.model(
+        # use_cache=False: hf kendi cache'ini oluşturmuyor, attention'lar K/V'yi
+        # kv_manager'a yazıyor. mask verilmiyor (Triton attention causal + pad'siz)
+        outputs = self.model(
             input_ids=self.static_token,
-            past_key_values=self.kv_cache,
-            attention_mask=self.static_causal_mask,
             position_ids=self.static_position_ids,
+            kv_manager=self.kv_cache,
             logits_to_keep=1,
-            use_cache=True
+            use_cache=False
         )
+        # bütün katmanlar yazdıktan sonra bir kez: graph'a kaydedilir, her replay +1
+        self.kv_cache.advance(1)
+        return outputs
 
     def replay(self):
         with nvtx.range("manual_graph_replay"):
@@ -141,11 +135,11 @@ class DecodeGraph:
 _decode_graphs = {}
 
 
-def get_decode_graph(model, max_len):
-    key = (model, max_len)
-    if key not in _decode_graphs:
-        _decode_graphs[key] = DecodeGraph(model, max_len)
-    return _decode_graphs[key]
+def get_decode_graph(model):
+    # model başına tek graph (ilk çağrıda derleme + capture)
+    if model not in _decode_graphs:
+        _decode_graphs[model] = DecodeGraph(model, KV_CACHE_CAPACITY)
+    return _decode_graphs[model]
 
 
 def generate(model, inputs, eos_token_ids, max_new_tokens=10, on_token=None):
@@ -162,31 +156,34 @@ def generate(model, inputs, eos_token_ids, max_new_tokens=10, on_token=None):
     device = inputs["input_ids"].device
     prompt_len = inputs["input_ids"].shape[-1]
 
+    if prompt_len + max_new_tokens > KV_CACHE_CAPACITY:
+        raise ValueError(
+            f"prompt + yeni token ({prompt_len} + {max_new_tokens}) KV cache "
+            f"kapasitesini ({KV_CACHE_CAPACITY}) aşıyor"
+        )
+
     generated_ids = torch.empty(
         (1, max_new_tokens), device=device, dtype=torch.long
     )
     num_generated = 0
 
     with torch.inference_mode():
-        decode_graph = get_decode_graph(model, prompt_len + max_new_tokens)
+        # prefill de K/V'yi manager'a TritonQwen2Attention üzerinden yazıyor
+        use_triton_attention(model)
+        decode_graph = get_decode_graph(model)
         kv_cache = decode_graph.kv_cache
-        causal_mask = decode_graph.static_causal_mask
 
+        # yeni istek: cache baştan (prefill pozisyonları 0..prompt_len-1)
         kv_cache.reset()
-
-        # prompt'taki pad'ler kapalı kalır, üretilecek slotlar adım adım açılır
-        causal_mask.fill_(float("-inf"))
-        causal_mask[0, 0, 0, :prompt_len].masked_fill_(
-            inputs["attention_mask"][0].bool(), 0
-        )
 
         outputs = model(
             input_ids=inputs["input_ids"],
-            attention_mask=inputs["attention_mask"],
-            past_key_values=kv_cache,
+            position_ids=torch.arange(prompt_len, device=device)[None],
+            kv_manager=kv_cache,
             logits_to_keep=1,
-            use_cache=True
+            use_cache=False
         )
+        kv_cache.advance(prompt_len)
         logits = outputs.logits
 
         with nvtx.range("manual_decode"):
@@ -210,8 +207,8 @@ def generate(model, inputs, eos_token_ids, max_new_tokens=10, on_token=None):
                 with nvtx.range("store_token"):
                     generated_ids[:, step] = next_token[:, 0]
 
-                # prefill pozisyonları arange ile verdiği için (pad'ler dahil)
-                # decode pozisyonları da onun devamı
+                # decode pozisyonları prefill'in (0..prompt_len-1) devamı; cache'e yazma
+                # pozisyonu manager.start, ikisi aynı ilerliyor
                 position = prompt_len + num_generated
                 num_generated += 1
 
@@ -220,7 +217,6 @@ def generate(model, inputs, eos_token_ids, max_new_tokens=10, on_token=None):
 
                 decode_graph.static_token.copy_(next_token)
                 decode_graph.static_position_ids.fill_(position)
-                causal_mask[..., position] = 0
 
                 with nvtx.range("decode_forward"):
                     logits = decode_graph.replay()

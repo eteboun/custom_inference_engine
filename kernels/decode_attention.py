@@ -27,7 +27,7 @@ def decode_gqa_attention_kernel_load(
 
     # gecerli uzunluk runtime'da GPU'dan okunuyor: her L icin yeniden derleme yok,
     # CUDA graph replay'inde de her adimda guncel deger okunur.
-    # K/V buffer'i L'den uzun olabilir (StaticCache: max_len), head adimi ayri veriliyor
+    # K/V buffer'i L'den uzun olabilir (KV cache kapasitesi), head adimi ayri veriliyor
     L = tl.load(SEQ_LEN).to(tl.int32)
 
     cols = tl.arange(0, BLOCK_D)

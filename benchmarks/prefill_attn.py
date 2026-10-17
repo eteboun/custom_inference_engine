@@ -1,5 +1,5 @@
 # prefill GQA attention: Triton kernel'i vs sdpa (causal, enable_gqa), doğruluk + süre.
-# K/V StaticCache düzeninde (H_kv, max_len, D), T'den sonraki satırlar çöp: kernel L'nin
+# K/V KV cache düzeninde (H_kv, max_len, D), T'den sonraki satırlar çöp: kernel L'nin
 # ötesini okursa sonuç bozulur. proje kökünden: python -m benchmarks.prefill_attn
 import torch
 import torch.nn.functional as F
