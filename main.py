@@ -80,9 +80,10 @@ class DecodeGraph:
             self.static_position_ids = torch.zeros(
                 (1, 1), device=device, dtype=torch.long
             )
-            # buffer'lar burada bir kez ayrılıyor, adresleri sabit (graph bunları kaydediyor)
+            # buffer'lar burada bir kez ayrılıyor, adresleri sabit (graph bunları kaydediyor).
+            # generate şimdilik tek dizi: batch_size 1
             self.kv_cache = KVCacheManager(
-                model.config, max_len, device, model.dtype
+                model.config, max_len, 1, device, model.dtype
             )
 
             # attention'lar Triton'a çevrilmiş olmalı (use_triton_attention):

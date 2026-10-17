@@ -144,7 +144,7 @@ GQA_PREFILL_CONFIG = {"BLOCK_M": 16, "BLOCK_N": 64, "num_warps": 4}
 # torch.compile için custom op. triton_op + wrap_triton ile inductor kernel'leri
 # opak bir çağrı olarak değil, kendi ürettiği kodun içinde doğrudan çalıştırır
 # (etrafındaki RMSNorm/RoPE füzyonları bozulmaz). eager'da da normal fonksiyon gibi çalışır.
-# k/v StaticCache buffer'ı (değiştirilmiyor), seq_len geçerli uzunluk (GPU, tek eleman)
+# k/v KV cache buffer'ı (değiştirilmiyor), seq_len dizi başına geçerli uzunluk (GPU, (B,))
 @triton_op("inference::gqa_decode_attention", mutates_args=())
 def gqa_decode_attention_op(
     q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, seq_len: torch.Tensor
@@ -154,17 +154,18 @@ def gqa_decode_attention_op(
 
 class TritonQwen2Attention(torch.nn.Module):
     # orijinal Qwen2Attention modülünün yerine geçer (replace_attention).
-    # model forward'una kv_manager (kv_cache.KVCacheManager) verilince batch 1'de:
-    # q/k/v projeksiyonu (tek matmul) + RoPE, K/V manager'a yazılır (update, pozisyon
-    # manager.start'tan), sonra attention:
-    # - decode (tek token): Triton GQA kernel'i, geçerli uzunluk manager.start + 1
-    #   (GPU'da, yeni token dahil). CUDA graph'ta her replay'de günceldir
+    # model forward'una kv_manager (kv_cache.KVCacheManager) verilince, batch boyutu
+    # manager'ın batch_size'ı: q/k/v projeksiyonu (tek matmul) + RoPE, K/V manager'a
+    # yazılır (update, dizi başına pozisyon manager.start'tan), sonra attention:
+    # - decode (tek token): Triton GQA kernel'i, dizi başına geçerli uzunluk
+    #   manager.start + 1 (GPU'da, yeni token dahil). CUDA graph'ta her replay'de günceldir
     # - prefill (T > 1): sdpa, causal, sadece bu T token'ın K/V'si. cache boş olmalı
     #   (start = 0, query pozisyonları 0..T-1); generate prefill'den önce reset ediyor.
+    #   farklı uzunluklu prompt'lar right padding'le verilebilir, advance gerçek uzunluklarla
     #   prefill için Triton kernel'i de var (prefill_gqa_attention) ama WSL'de sdpa'nın
     #   FlashAttention 2'sinden uzun prompt'larda yavaş (bkz. GQA_PREFILL_CONFIG)
     # manager.advance çağırana ait (adım başına bir kez, bütün katmanlardan sonra).
-    # attention_mask kullanılmıyor (causal + pad'siz varsayılıyor), prompt'ta pad olmamalı.
+    # attention_mask kullanılmıyor (causal; pad sadece sağda olabilir).
     # kv_manager verilmezse orijinal modüle (sdpa) gider
     def __init__(self, original_attn):
         super().__init__()
@@ -196,15 +197,15 @@ class TritonQwen2Attention(torch.nn.Module):
 
     def forward(self, hidden_states, position_embeddings, attention_mask,
                 past_key_values=None, kv_manager=None, **kwargs):
-        if kv_manager is None or hidden_states.shape[0] != 1:
+        if kv_manager is None:
             return self.original(
                 hidden_states, position_embeddings, attention_mask,
                 past_key_values=past_key_values, **kwargs
             )
 
         attn = self.original
-        T = hidden_states.shape[1]
-        hidden_shape = (1, T, -1, self.head_dim)
+        B, T = hidden_states.shape[:2]
+        hidden_shape = (B, T, -1, self.head_dim)
         if self.fuse_qkv:
             q, k, v = torch.nn.functional.linear(
                 hidden_states, self.qkv_weight, self.qkv_bias
@@ -218,29 +219,31 @@ class TritonQwen2Attention(torch.nn.Module):
         cos, sin = position_embeddings
         query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
 
-        # manager token sırasında (T, H_kv, D) bekliyor: key_states (1, H_kv, T, D)'nin
+        # manager token sırasında (B, T, H_kv, D) bekliyor: key_states (B, H_kv, T, D)'nin
         # transpose'u, kopyasız view
         kv_manager.update(
-            self.layer_idx, key_states[0].transpose(0, 1), value_states[0].transpose(0, 1)
+            self.layer_idx, key_states.transpose(1, 2), value_states.transpose(1, 2)
         )
 
         if T == 1:
-            # update start'ı ilerletmiyor: yeni token start pozisyonunda, uzunluk start + 1
-            # kernel batch'li (B, ...) bekliyor, manager şimdilik tek dizi: B = 1
+            # update start'ı ilerletmiyor: her dizinin yeni token'ı kendi start
+            # pozisyonunda, uzunluk start + 1 (B,)
             o = gqa_decode_attention_op(
-                query_states.reshape(1, self.num_heads, self.head_dim),
-                kv_manager.keys[self.layer_idx][None],
-                kv_manager.values[self.layer_idx][None],
+                query_states.reshape(B, self.num_heads, self.head_dim),
+                kv_manager.keys[self.layer_idx],
+                kv_manager.values[self.layer_idx],
                 kv_manager.start + 1,
             )
         else:
             # boş cache'ten prefill: geçmiş yok, attention sadece bu T token'ın K/V'si
-            # (cache'ten okumak yerine elimizdeki tensörler). (1, H_q, T, D) -> (1, T, H_q, D)
+            # (cache'ten okumak yerine elimizdeki tensörler). (B, H_q, T, D) -> (B, T, H_q, D).
+            # right padding'de pad'ler gerçek token'lardan sonra: causal mask yüzünden
+            # gerçek token'lar onları görmüyor, pad'lerin çıktısı kullanılmıyor
             o = F.scaled_dot_product_attention(
                 query_states, key_states, value_states, is_causal=True, enable_gqa=True
             ).transpose(1, 2)
 
-        attn_output = attn.o_proj(o.reshape(1, T, self.num_heads * self.head_dim))
+        attn_output = attn.o_proj(o.reshape(B, T, self.num_heads * self.head_dim))
         return attn_output, None
 
 

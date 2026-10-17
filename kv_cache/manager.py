@@ -2,10 +2,15 @@ import torch
 
 class KVCacheManager:
 
-    def __init__(self, config, max_cache_len, device, dtype):
+    def __init__(
+            self, config,
+            max_cache_len, batch_size,
+            device, dtype
+    ):
 
         self.config = config
         self.max_cache_len = max_cache_len
+        self.batch_size = batch_size
         self.device = device
         self.dtype = dtype
 
@@ -21,7 +26,8 @@ class KVCacheManager:
 
         self.keys = [
             torch.zeros(
-                size=(self.num_kv_heads, max_cache_len, self.head_dim),
+                size=(batch_size, self.num_kv_heads,
+                      max_cache_len, self.head_dim),
                 device=device,
                 dtype=dtype,
             ) for _ in range(self.num_layers)
@@ -29,15 +35,26 @@ class KVCacheManager:
 
         self.values = [
             torch.zeros(
-                size=(self.num_kv_heads, max_cache_len, self.head_dim),
+                size=(batch_size, self.num_kv_heads,
+                      max_cache_len, self.head_dim),
                 device=device,
                 dtype=dtype,
             ) for _ in range(self.num_layers)
         ]
 
-        self.start = torch.tensor(
-            [0], device=device, dtype=torch.long
+        self.start = torch.zeros(
+            size=(batch_size,), device=device, dtype=torch.long
         )
+
+        self._batch_range = torch.arange(
+            self.batch_size,
+            device=self.device
+        )[:, None, None]
+
+        self._head_range = torch.arange(
+            self.num_kv_heads,
+            device=self.device
+        )[None, :, None]
 
     def update(
             self,
@@ -45,25 +62,35 @@ class KVCacheManager:
             k_proj: torch.Tensor,
             v_proj: torch.Tensor
     ) -> None:
-        L = k_proj.size(0)
-
-        kv_indices = self.start + torch.arange(L, device=self.device)
+        L = k_proj.size(1)
 
         k_cache = self.keys[layer_num]
         k_new = k_proj.reshape(
-            L, self.num_kv_heads, self.head_dim
-        ).transpose(0, 1)
+            self.batch_size, L, self.num_kv_heads, self.head_dim
+        ).transpose(1, 2)
 
         v_cache = self.values[layer_num]
         v_new = v_proj.reshape(
-            L, self.num_kv_heads, self.head_dim
-        ).transpose(0, 1)
+            self.batch_size, L, self.num_kv_heads, self.head_dim
+        ).transpose(1, 2)
 
-        k_cache.index_copy_(1, kv_indices, k_new)
-        v_cache.index_copy_(1, kv_indices, v_new)
+        pos = (
+                self.start[:, None]
+                + torch.arange(L, device=self.device)[None, :]
+            )[:, None, :]
 
-    def advance(self, L: int) -> None:
-        self.start += L
+        k_cache.index_put_(
+            (self._batch_range, self._head_range, pos),
+            k_new
+        )
+
+        v_cache.index_put_(
+            (self._batch_range, self._head_range, pos),
+            v_new
+        )
+
+    def advance(self, lengths: torch.Tensor) -> None:
+        self.start += lengths
 
     def reset(self) -> None:
         self.start.zero_()
