@@ -65,25 +65,27 @@ def use_triton_attention(model):
 
 
 class DecodeGraph:
-    # tek token'lık decode forward'unu bir kez CUDA graph olarak kaydeder,
-    # sonraki generate çağrılarında aynı buffer'lar ve cache ile tekrar kullanılır.
-    # cache max_len kapasiteli, max_len'e kadar her prompt uzunluğu bu graph'la çalışır
+    # batch_size dizinin birer token'lık decode forward'unu bir kez CUDA graph olarak
+    # kaydeder, sonraki generate çağrılarında aynı buffer'lar ve cache ile tekrar kullanılır.
+    # cache dizi başına max_len kapasiteli, max_len'e kadar her prompt uzunluğu bu graph'la
+    # çalışır. batch boyutu graph'ın şekillerine gömülü: her batch boyutu ayrı graph
 
-    def __init__(self, model, max_len, warmup_iters=3):
+    def __init__(self, model, max_len, batch_size=1, warmup_iters=3):
         self.model = model
+        self.batch_size = batch_size
+        self.max_len = max_len
         device = model.device
 
         with torch.inference_mode():
             self.static_token = torch.zeros(
-                (1, 1), device=device, dtype=torch.long
+                (batch_size, 1), device=device, dtype=torch.long
             )
             self.static_position_ids = torch.zeros(
-                (1, 1), device=device, dtype=torch.long
+                (batch_size, 1), device=device, dtype=torch.long
             )
-            # buffer'lar burada bir kez ayrılıyor, adresleri sabit (graph bunları kaydediyor).
-            # generate şimdilik tek dizi: batch_size 1
+            # buffer'lar burada bir kez ayrılıyor, adresleri sabit (graph bunları kaydediyor)
             self.kv_cache = KVCacheManager(
-                model.config, max_len, 1, device, model.dtype
+                model.config, max_len, batch_size, device, model.dtype
             )
 
             # attention'lar Triton'a çevrilmiş olmalı (use_triton_attention):
@@ -123,7 +125,8 @@ class DecodeGraph:
             logits_to_keep=1,
             use_cache=False
         )
-        # bütün katmanlar yazdıktan sonra bir kez: graph'a kaydedilir, her replay +1
+        # bütün katmanlar yazdıktan sonra bir kez: graph'a kaydedilir, her replay
+        # bütün dizilerde +1
         self.kv_cache.advance(1)
         return outputs
 
@@ -136,11 +139,31 @@ class DecodeGraph:
 _decode_graphs = {}
 
 
-def get_decode_graph(model):
-    # model başına tek graph (ilk çağrıda derleme + capture)
-    if model not in _decode_graphs:
-        _decode_graphs[model] = DecodeGraph(model, KV_CACHE_CAPACITY)
-    return _decode_graphs[model]
+# batch'li decode graph'larının batch boyutları (kovalar). gerçek batch boyutu kendisinden
+# büyük ilk kovaya yuvarlanır, fazla slotlar sahte dizilerle doldurulur. küçük batch'te
+# decode ağırlık okumaya bağlı, fazladan birkaç dizi adım süresini pek değiştirmiyor
+DECODE_BATCH_BUCKETS = (1, 2, 4, 8, 16)
+
+
+def decode_bucket(batch_size):
+    for bucket in DECODE_BATCH_BUCKETS:
+        if batch_size <= bucket:
+            return bucket
+    raise ValueError(
+        f"batch size {batch_size} en büyük kovadan ({DECODE_BATCH_BUCKETS[-1]}) büyük"
+    )
+
+
+def get_decode_graph(model, batch_size=1):
+    # (model, batch boyutu) başına bir graph (ilk çağrıda derleme + capture).
+    # toplam cache her graph'ta KV_CACHE_CAPACITY token (~400 MB): dizi başına kapasite
+    # KV_CACHE_CAPACITY // batch_size
+    key = (model, batch_size)
+    if key not in _decode_graphs:
+        _decode_graphs[key] = DecodeGraph(
+            model, KV_CACHE_CAPACITY // batch_size, batch_size
+        )
+    return _decode_graphs[key]
 
 
 def generate(model, inputs, eos_token_ids, max_new_tokens=10, on_token=None):
@@ -223,6 +246,96 @@ def generate(model, inputs, eos_token_ids, max_new_tokens=10, on_token=None):
                     logits = decode_graph.replay()
 
     return generated_ids[0, :num_generated].tolist()
+
+
+def generate_batch(model, prompts, eos_token_ids, max_new_tokens=10, on_step=None):
+    # static batching: prompts (token id listeleri) birlikte prefill edilir, sonra her
+    # adımda tek graph replay'i bütün dizilere birer token üretir. biten dizi graph'tan
+    # çıkamıyor (şekil sabit), çalışmaya devam ediyor ama token'ları atılıyor. döngü
+    # bütün diziler bitince ya da max_new_tokens'te durur.
+    # on_step: adım başına bir kez (ilk çağrı prefill'den sonra, ilk token'lar seçilince):
+    # aynı adımın token'ları birlikte çıkıyor, TPOT her dizi için aynı.
+    # dönüş: dizi başına üretilen token'lar (eos hariç)
+    B = len(prompts)
+    if B == 0 or max_new_tokens <= 0:
+        return [[] for _ in prompts]
+    if any(len(p) == 0 for p in prompts):
+        raise ValueError("boş prompt desteklenmiyor")
+
+    bucket = decode_bucket(B)
+    lens_list = [len(p) for p in prompts]
+    T = max(lens_list)
+
+    with torch.inference_mode():
+        use_triton_attention(model)
+        decode_graph = get_decode_graph(model, bucket)
+        kv_cache = decode_graph.kv_cache
+        device = model.device
+
+        # bütün diziler aynı sayıda adım ilerliyor (biten de): en uzun prompt sığmalı
+        if T + max_new_tokens > decode_graph.max_len:
+            raise ValueError(
+                f"prompt + yeni token ({T} + {max_new_tokens}) dizi başına KV cache "
+                f"kapasitesini ({decode_graph.max_len}, batch {bucket}) aşıyor"
+            )
+
+        # right padding: kernel sadece uzunluk biliyor, geçerli token'lar her dizinin başında
+        # olmalı. kovanın fazla slotları tek token'lık sahte dizi (L >= 1, kernel'de
+        # boş dizi yok), çıktıları kullanılmıyor
+        input_ids = torch.zeros((bucket, T), dtype=torch.long)
+        lens = torch.ones(bucket, dtype=torch.long)
+        for b, p in enumerate(prompts):
+            input_ids[b, :len(p)] = torch.tensor(p)
+            lens[b] = len(p)
+        input_ids, lens = input_ids.to(device), lens.to(device)
+
+        kv_cache.reset()
+
+        # lm_head sadece her dizinin son gerçek token'ında: bütün pozisyonların
+        # logit'i (bucket x T x 151936) uzun prompt'ta GB'larca olurdu.
+        # pad'ler causal mask yüzünden gerçek token'ları etkilemiyor
+        hidden = model.model(
+            input_ids=input_ids,
+            position_ids=torch.arange(T, device=device)[None].expand(bucket, T),
+            kv_manager=kv_cache,
+            use_cache=False
+        ).last_hidden_state
+        kv_cache.advance(lens)
+        logits = model.lm_head(hidden[torch.arange(bucket, device=device), lens - 1])[:, None]
+
+        outputs = [[] for _ in range(B)]
+        finished = [False] * B
+
+        with nvtx.range("manual_batch_decode"):
+            for step in range(max_new_tokens):
+                next_tokens = torch.argmax(logits[:, -1, :], dim=-1)
+
+                # host'a tek kopya (adım başına bir sync, B=1 generate'teki .item() gibi)
+                tokens = next_tokens[:B].tolist()
+
+                if on_step is not None:
+                    on_step()
+
+                for b, token in enumerate(tokens):
+                    if finished[b]:
+                        continue
+                    if token in eos_token_ids:
+                        finished[b] = True
+                    else:
+                        outputs[b].append(token)
+
+                if all(finished) or step == max_new_tokens - 1:
+                    break
+
+                # her dizinin yeni token'ı kendi pozisyonunda: manager.start (cache'e
+                # yazma pozisyonu) ile aynı, graph replay sonunda +1
+                decode_graph.static_token.copy_(next_tokens[:, None])
+                decode_graph.static_position_ids.copy_(kv_cache.start[:, None])
+
+                with nvtx.range("decode_forward"):
+                    logits = decode_graph.replay()
+
+    return outputs
 
 
 _vllm_engine = None
