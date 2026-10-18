@@ -248,6 +248,37 @@ def generate(model, inputs, eos_token_ids, max_new_tokens=10, on_token=None):
     return generated_ids[0, :num_generated].tolist()
 
 
+# generate_batch'in prefill'i torch.compile (inductor) ile: elementwise işler (RMSNorm,
+# RoPE, SiLU * up, residual) birleşiyor, matmul'ler cuBLAS'ta, attention sdpa'da kalıyor.
+# CUDA graph yok (prompt uzunluğu değişken). False: eager
+COMPILE_PREFILL = True
+
+
+def prefill_forward(model, input_ids, position_ids, lens, kv_cache):
+    # lm_head sadece her dizinin son gerçek token'ında: bütün pozisyonların
+    # logit'i (B x T x 151936) uzun prompt'ta GB'larca olurdu.
+    # pad'ler causal mask yüzünden gerçek token'ları etkilemiyor
+    hidden = model.model(
+        input_ids=input_ids,
+        position_ids=position_ids,
+        kv_manager=kv_cache,
+        use_cache=False
+    ).last_hidden_state
+    batch = torch.arange(input_ids.shape[0], device=input_ids.device)
+    return model.lm_head(hidden[batch, lens - 1])[:, None]
+
+
+_prefill_fns = {}
+
+
+def get_prefill_fn(model):
+    # model başına bir derlenmiş fonksiyon. her decode kovasının ayrı manager'ı var
+    # (dynamo nesneye guard koyuyor): kova başına bir derleme, prompt uzunluğu dinamik
+    if model not in _prefill_fns:
+        _prefill_fns[model] = torch.compile(prefill_forward, fullgraph=True)
+    return _prefill_fns[model]
+
+
 def generate_batch(model, prompts, eos_token_ids, max_new_tokens=10, on_step=None):
     # static batching: prompts (token id listeleri) birlikte prefill edilir, sonra her
     # adımda tek graph replay'i bütün dizilere birer token üretir. biten dizi graph'tan
@@ -291,17 +322,15 @@ def generate_batch(model, prompts, eos_token_ids, max_new_tokens=10, on_step=Non
 
         kv_cache.reset()
 
-        # lm_head sadece her dizinin son gerçek token'ında: bütün pozisyonların
-        # logit'i (bucket x T x 151936) uzun prompt'ta GB'larca olurdu.
-        # pad'ler causal mask yüzünden gerçek token'ları etkilemiyor
-        hidden = model.model(
-            input_ids=input_ids,
-            position_ids=torch.arange(T, device=device)[None].expand(bucket, T),
-            kv_manager=kv_cache,
-            use_cache=False
-        ).last_hidden_state
+        position_ids = torch.arange(T, device=device)[None].expand(bucket, T)
+        prefill = get_prefill_fn(model) if COMPILE_PREFILL else prefill_forward
+        if COMPILE_PREFILL and T > 1:
+            # prompt uzunluğu dinamik: her T için yeniden derleme yok (T = 1 statik
+            # derleniyor, 0/1 boyutları sembolik olamıyor)
+            torch._dynamo.mark_dynamic(input_ids, 1)
+            torch._dynamo.mark_dynamic(position_ids, 1)
+        logits = prefill(model, input_ids, position_ids, lens, kv_cache)
         kv_cache.advance(lens)
-        logits = model.lm_head(hidden[torch.arange(bucket, device=device), lens - 1])[:, None]
 
         outputs = [[] for _ in range(B)]
         finished = [False] * B
