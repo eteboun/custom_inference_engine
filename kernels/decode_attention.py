@@ -23,10 +23,8 @@ def decode_gqa_attention_kernel_load(
     BLOCK_G: tl.constexpr,
     GROUP_SIZE: tl.constexpr
 ):
-    # Q: (B, H_q, D) contiguous
-    # KV: (B, H_kv, max_len, D). batch ve head adimlari host'tan stride olarak geliyor,
-    # head icinde satir adimi D. stride'lar siradan int: kapasite / batch boyutu
-    # degisince yeniden derleme yok. ofsetlerin int32'ye sigdigini host kontrol ediyor
+    # Q: (total_T, H_q, D)
+    # KV: (B, H_kv, CAP, D)
 
     partition_idx = tl.program_id(0)
     kv_head_idx = tl.program_id(1)
@@ -175,7 +173,7 @@ def decode_attention_kernel_merge(
     BLOCK_P: tl.constexpr,
     BLOCK_D: tl.constexpr,
 ):
-    # O: (B, H_q, D)
+    # O: (total_T, H_q, D)
     # partial_m, partial_l: (B, H_q, P)
     # partial_acc: (B, H_q, P, D)
 

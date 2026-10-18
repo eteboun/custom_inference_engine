@@ -77,11 +77,12 @@ class DecodeGraph:
         device = model.device
 
         with torch.inference_mode():
+            # paketli: (1, total_T), decode'da total_T = batch_size
             self.static_token = torch.zeros(
-                (batch_size, 1), device=device, dtype=torch.long
+                (1, batch_size), device=device, dtype=torch.long
             )
             self.static_position_ids = torch.zeros(
-                (batch_size, 1), device=device, dtype=torch.long
+                (1, batch_size), device=device, dtype=torch.long
             )
             # buffer'lar burada bir kez ayrılıyor, adresleri sabit (graph bunları kaydediyor)
             self.kv_cache = KVCacheManager(
@@ -98,6 +99,7 @@ class DecodeGraph:
             side_stream.wait_stream(torch.cuda.current_stream())
             with torch.cuda.stream(side_stream):
                 self.kv_cache.reset()
+                self.kv_cache.prepare_decode()
                 self._forward()
 
                 # mode varsayılan (CUDA graph'sız): graph'ı aşağıda biz
@@ -108,26 +110,31 @@ class DecodeGraph:
 
                 for _ in range(warmup_iters):
                     self.kv_cache.reset()
+                    self.kv_cache.prepare_decode()
                     forward()
             torch.cuda.current_stream().wait_stream(side_stream)
 
+            # prepare_decode capture'ın içinde: seq_idx'i üreten kernel graph'a giriyor,
+            # replay'ler prefill'in manager'a yazdığı indekslerden etkilenmiyor
             self.graph = torch.cuda.CUDAGraph()
             with torch.cuda.graph(self.graph):
-                self.static_logits = forward().logits
+                self.kv_cache.prepare_decode()
+                self.static_logits = forward().logits[0]
 
     def _forward(self):
         # use_cache=False: hf kendi cache'ini oluşturmuyor, attention'lar K/V'yi
         # kv_manager'a yazıyor. mask verilmiyor (Triton attention causal + pad'siz)
+        # logits_to_keep=0: bütün pozisyonlar, paketli decode'da her pozisyon bir dizi
         outputs = self.model(
             input_ids=self.static_token,
             position_ids=self.static_position_ids,
             kv_manager=self.kv_cache,
-            logits_to_keep=1,
+            logits_to_keep=0,
             use_cache=False
         )
         # bütün katmanlar yazdıktan sonra bir kez: graph'a kaydedilir, her replay
         # bütün dizilerde +1
-        self.kv_cache.advance(1)
+        self.kv_cache.advance()
         return outputs
 
     def replay(self):
@@ -199,6 +206,7 @@ def generate(model, inputs, eos_token_ids, max_new_tokens=10, on_token=None):
 
         # yeni istek: cache baştan (prefill pozisyonları 0..prompt_len-1)
         kv_cache.reset()
+        kv_cache.prepare_prefill([prompt_len])
 
         outputs = model(
             input_ids=inputs["input_ids"],
@@ -207,14 +215,15 @@ def generate(model, inputs, eos_token_ids, max_new_tokens=10, on_token=None):
             logits_to_keep=1,
             use_cache=False
         )
-        kv_cache.advance(prompt_len)
-        logits = outputs.logits
+        kv_cache.advance()
+        # (1, vocab): decode graph'ının static_logits'i ile aynı şekil
+        logits = outputs.logits[0]
 
         with nvtx.range("manual_decode"):
             for step in range(max_new_tokens):
                 with nvtx.range("argmax"):
                     next_token = torch.argmax(
-                        logits[:, -1, :],
+                        logits,
                         dim=-1,
                         keepdim=True
                     )
@@ -249,23 +258,21 @@ def generate(model, inputs, eos_token_ids, max_new_tokens=10, on_token=None):
 
 
 # generate_batch'in prefill'i torch.compile (inductor) ile: elementwise işler (RMSNorm,
-# RoPE, SiLU * up, residual) birleşiyor, matmul'ler cuBLAS'ta, attention sdpa'da kalıyor.
+# RoPE, SiLU * up, residual) birleşiyor, matmul'ler cuBLAS'ta, attention Triton varlen kernel'i.
 # CUDA graph yok (prompt uzunluğu değişken). False: eager
 COMPILE_PREFILL = True
 
 
-def prefill_forward(model, input_ids, position_ids, lens, kv_cache):
-    # lm_head sadece her dizinin son gerçek token'ında: bütün pozisyonların
-    # logit'i (B x T x 151936) uzun prompt'ta GB'larca olurdu.
-    # pad'ler causal mask yüzünden gerçek token'ları etkilemiyor
+def prefill_forward(model, input_ids, position_ids, kv_cache):
+    # paketli: input_ids / position_ids (1, total_T). lm_head sadece her dizinin son
+    # token'ında (cu_seqlens[1:] - 1): bütün pozisyonların logit'i uzun prompt'ta GB'larca
     hidden = model.model(
         input_ids=input_ids,
         position_ids=position_ids,
         kv_manager=kv_cache,
         use_cache=False
     ).last_hidden_state
-    batch = torch.arange(input_ids.shape[0], device=input_ids.device)
-    return model.lm_head(hidden[batch, lens - 1])[:, None]
+    return model.lm_head(hidden[0, kv_cache.cu_seqlens[1:] - 1])
 
 
 _prefill_fns = {}
@@ -294,6 +301,9 @@ def generate_batch(model, prompts, eos_token_ids, max_new_tokens=10, on_step=Non
         raise ValueError("boş prompt desteklenmiyor")
 
     bucket = decode_bucket(B)
+    # kovanın fazla slotları tek token'lık sahte dizi (kernel'de boş dizi yok),
+    # çıktıları kullanılmıyor
+    prompts = list(prompts) + [[0]] * (bucket - B)
     lens_list = [len(p) for p in prompts]
     T = max(lens_list)
 
@@ -310,34 +320,35 @@ def generate_batch(model, prompts, eos_token_ids, max_new_tokens=10, on_step=Non
                 f"kapasitesini ({decode_graph.max_len}, batch {bucket}) aşıyor"
             )
 
-        # right padding: kernel sadece uzunluk biliyor, geçerli token'lar her dizinin başında
-        # olmalı. kovanın fazla slotları tek token'lık sahte dizi (L >= 1, kernel'de
-        # boş dizi yok), çıktıları kullanılmıyor
-        input_ids = torch.zeros((bucket, T), dtype=torch.long)
-        lens = torch.ones(bucket, dtype=torch.long)
-        for b, p in enumerate(prompts):
-            input_ids[b, :len(p)] = torch.tensor(p)
-            lens[b] = len(p)
-        input_ids, lens = input_ids.to(device), lens.to(device)
+        # paketli: diziler pad'siz uç uca, (1, total_T)
+        input_ids = torch.tensor(
+            [t for p in prompts for t in p], device=device
+        )[None]
+        total_T = input_ids.shape[1]
 
         kv_cache.reset()
+        kv_cache.prepare_prefill(lens_list)
+        # boş cache'te pos dizi içi konum: RoPE pozisyonu
+        position_ids = kv_cache.pos[None]
 
-        position_ids = torch.arange(T, device=device)[None].expand(bucket, T)
         prefill = get_prefill_fn(model) if COMPILE_PREFILL else prefill_forward
-        if COMPILE_PREFILL and T > 1:
-            # prompt uzunluğu dinamik: her T için yeniden derleme yok (T = 1 statik
-            # derleniyor, 0/1 boyutları sembolik olamıyor)
+        if COMPILE_PREFILL and total_T > 1:
+            # total_T dinamik: her toplam uzunluk için yeniden derleme yok (1 statik
+            # derleniyor, 0/1 boyutları sembolik olamıyor). manager'ın total_T
+            # uzunluklu indeksleri de
             torch._dynamo.mark_dynamic(input_ids, 1)
             torch._dynamo.mark_dynamic(position_ids, 1)
-        logits = prefill(model, input_ids, position_ids, lens, kv_cache)
-        kv_cache.advance(lens)
+            torch._dynamo.mark_dynamic(kv_cache.pos, 0)
+            torch._dynamo.mark_dynamic(kv_cache.seq_idx, 0)
+        logits = prefill(model, input_ids, position_ids, kv_cache)
+        kv_cache.advance()
 
         outputs = [[] for _ in range(B)]
         finished = [False] * B
 
         with nvtx.range("manual_batch_decode"):
             for step in range(max_new_tokens):
-                next_tokens = torch.argmax(logits[:, -1, :], dim=-1)
+                next_tokens = torch.argmax(logits, dim=-1)
 
                 # host'a tek kopya (adım başına bir sync, B=1 generate'teki .item() gibi)
                 tokens = next_tokens[:B].tolist()
@@ -358,8 +369,8 @@ def generate_batch(model, prompts, eos_token_ids, max_new_tokens=10, on_step=Non
 
                 # her dizinin yeni token'ı kendi pozisyonunda: manager.start (cache'e
                 # yazma pozisyonu) ile aynı, graph replay sonunda +1
-                decode_graph.static_token.copy_(next_tokens[:, None])
-                decode_graph.static_position_ids.copy_(kv_cache.start[:, None])
+                decode_graph.static_token.copy_(next_tokens[None])
+                decode_graph.static_position_ids.copy_(kv_cache.start[None])
 
                 with nvtx.range("decode_forward"):
                     logits = decode_graph.replay()

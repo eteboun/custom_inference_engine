@@ -1,4 +1,5 @@
 import torch
+from torch.nn import functional as F
 
 class KVCacheManager:
 
@@ -46,15 +47,47 @@ class KVCacheManager:
             size=(batch_size,), device=device, dtype=torch.long
         )
 
-        self._batch_range = torch.arange(
-            self.batch_size,
-            device=self.device
-        )[:, None, None]
+        self.decode_lens = torch.ones(
+            self.batch_size, dtype=torch.long, device=self.device
+        )
 
-        self._head_range = torch.arange(
-            self.num_kv_heads,
-            device=self.device
-        )[None, :, None]
+        self.pos = None
+        self.seq_idx = None
+        self.cu_seqlens = None
+        self.lens = None
+        self.max_seqlen = 0
+        self.is_decode = False
+
+    def prepare_prefill(
+            self,
+            lens_list: list[int]
+    ):
+        total_T = sum(lens_list)
+        max_seqlen = max(lens_list)
+        lens = torch.tensor(lens_list, dtype=torch.long, device=self.device)
+
+        cu_seqlens = F.pad(lens.cumsum(0), (1, 0))
+        seq_idx = torch.repeat_interleave(
+            torch.arange(self.batch_size, device=self.device),
+            lens,
+            output_size=total_T
+        )
+
+        offsets = torch.arange(total_T, device=self.device) - cu_seqlens[seq_idx]
+        pos = self.start[seq_idx] + offsets
+
+        self.pos = pos
+        self.seq_idx = seq_idx
+        self.is_decode = False
+        self.cu_seqlens = cu_seqlens
+        self.lens = lens
+        self.max_seqlen = max_seqlen
+
+    def prepare_decode(self):
+        self.lens = self.decode_lens
+        self.seq_idx = torch.arange(self.batch_size, device=self.device)
+        self.pos = self.start
+        self.is_decode = True
 
     def update(
             self,
@@ -62,35 +95,18 @@ class KVCacheManager:
             k_proj: torch.Tensor,
             v_proj: torch.Tensor
     ) -> None:
-        L = k_proj.size(1)
-
         k_cache = self.keys[layer_num]
-        k_new = k_proj.reshape(
-            self.batch_size, L, self.num_kv_heads, self.head_dim
-        ).transpose(1, 2)
+        k_cache[self.seq_idx, :,self.pos] = k_proj.view(
+            -1, self.num_kv_heads, self.head_dim
+        )
 
         v_cache = self.values[layer_num]
-        v_new = v_proj.reshape(
-            self.batch_size, L, self.num_kv_heads, self.head_dim
-        ).transpose(1, 2)
-
-        pos = (
-                self.start[:, None]
-                + torch.arange(L, device=self.device)[None, :]
-            )[:, None, :]
-
-        k_cache.index_put_(
-            (self._batch_range, self._head_range, pos),
-            k_new
+        v_cache[self.seq_idx, :, self.pos] = v_proj.view(
+            -1, self.num_kv_heads, self.head_dim
         )
 
-        v_cache.index_put_(
-            (self._batch_range, self._head_range, pos),
-            v_new
-        )
-
-    def advance(self, lengths: torch.Tensor) -> None:
-        self.start += lengths
+    def advance(self) -> None:
+        self.start += self.lens
 
     def reset(self) -> None:
         self.start.zero_()

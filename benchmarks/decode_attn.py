@@ -9,7 +9,7 @@ import torch.nn.functional as F
 from torch.nn.attention import sdpa_kernel, SDPBackend
 import triton
 
-from attn import decode_gqa_attention, default_num_programs
+from attn import decode_gqa_attention
 from benchmarks.bench_utils import capture_graph, time_graph, COLD_FOOTPRINT_L2_MULTIPLE
 
 
@@ -26,7 +26,7 @@ def benchmark(L, rng, H_q=14, H_kv=2, D=64, BLOCK_N=64, rounds=5):
     # Qwen2.5-0.5B: 14 q head, 2 kv head (7 q head aynı K/V'yi paylaşıyor), head_dim 64
     #
     # ölçülenler:
-    # triton: decode_gqa_attention, varsayılan num_programs, grid (P, H_kv)
+    # triton: decode_gqa_attention, num_programs = min(SM sayısı, blok sayısı), grid (P, H_kv)
     # sdpa: F.scaled_dot_product_attention(enable_gqa=True), varsayılan backend
     # cudnn: aynı çağrı, cuDNN backend'ine zorlanmış
     #
@@ -38,7 +38,9 @@ def benchmark(L, rng, H_q=14, H_kv=2, D=64, BLOCK_N=64, rounds=5):
     l2_bytes = torch.cuda.get_device_properties(0).L2_cache_size
     set_bytes = (2 * H_kv * L + H_q) * D * torch.finfo(torch.float16).bits // 8
     n_sets = triton.cdiv(COLD_FOOTPRINT_L2_MULTIPLE * l2_bytes, set_bytes)
-    num_programs = default_num_programs(L, BLOCK_N)
+    # her SM'e bir parça, blok sayısından fazla değil
+    sm_count = torch.cuda.get_device_properties(0).multi_processor_count
+    num_programs = min(sm_count, triton.cdiv(L, BLOCK_N))
 
     qs = torch.randn((n_sets, H_q, D), device="cuda", dtype=torch.float16)
     ks = torch.randn((n_sets, H_kv, L, D), device="cuda", dtype=torch.float16)

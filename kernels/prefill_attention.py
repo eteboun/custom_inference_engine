@@ -11,28 +11,37 @@ import triton.language as tl
 def prefill_gqa_attention_kernel(
     Q, K, V,
     O,
-    L,
-    MAX_LEN,
+    CAP,
+    CU_SEQLENS,
     D: tl.constexpr,
-    KV_HEADS: tl.constexpr,
     Q_HEADS: tl.constexpr,
+    KV_HEADS: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_D: tl.constexpr,
     BLOCK_G: tl.constexpr,
     GROUP_SIZE: tl.constexpr
 ):
-    # Q: (T, H_q, D)
-    # KV: (H_kv, max_len, D)
+    # Q: (total_T, H_q, D)
+    # KV: (B, H_kv, CAP, D)
 
     tile_idx = tl.program_id(0)
     kv_head_idx = tl.program_id(1)
+    seq_idx = tl.program_id(2)
+
+    seq_start = tl.load(CU_SEQLENS + seq_idx)
+    seq_end = tl.load(CU_SEQLENS + seq_idx + 1)
+    L = seq_end - seq_start
+
+    if tile_idx * BLOCK_M >= L:
+        return
 
     cols = tl.arange(0, BLOCK_D)
 
     q_rows = tl.arange(0, BLOCK_M)
     q_heads = tl.arange(0, BLOCK_G)
 
+    q_seq_offsets = seq_start * Q_HEADS * D
     q_row_offsets = (tile_idx * BLOCK_M * Q_HEADS * D
         + q_rows[:, None, None] * Q_HEADS * D)
     q_head_offsets = (kv_head_idx * GROUP_SIZE * D
@@ -45,7 +54,8 @@ def prefill_gqa_attention_kernel(
 
     # (BLOCK_M, BLOCK_G, BLOCK_D)
     qs = tl.load(
-        Q + q_head_offsets
+        Q + q_seq_offsets
+        + q_head_offsets
         + q_row_offsets
         + q_col_offsets,
         mask=q_head_mask
@@ -58,8 +68,9 @@ def prefill_gqa_attention_kernel(
     )
 
     kv_rows = tl.arange(0, BLOCK_N)
-    head_offsets = kv_head_idx * MAX_LEN * D
-    col_offsets = cols[None, :]
+    kv_seq_offsets = seq_idx * KV_HEADS * CAP * D
+    kv_head_offsets = kv_head_idx * CAP * D
+    kv_col_offsets = cols[None, :]
     kv_col_mask = cols[None, :] < D
 
     end = tl.minimum(L, (tile_idx + 1) * BLOCK_M)
@@ -73,14 +84,15 @@ def prefill_gqa_attention_kernel(
     ):
         rows = start + kv_rows
 
-        row_offsets = rows[:, None] * D
-        kv_row_mask = rows[:, None] < L
+        kv_row_offsets = rows[:, None] * D
+        kv_row_mask = rows[:, None] < CAP
 
         # (BLOCK_N, BLOCK_D)
         ks = tl.load(
-            K + head_offsets
-            + row_offsets
-            + col_offsets,
+            K + kv_seq_offsets
+            + kv_head_offsets
+            + kv_row_offsets
+            + kv_col_offsets,
             mask=kv_row_mask
                  & kv_col_mask,
             other=0
@@ -88,9 +100,10 @@ def prefill_gqa_attention_kernel(
 
         # (BLOCK_N, BLOCK_D)
         vs = tl.load(
-            V + head_offsets
-            + row_offsets
-            + col_offsets,
+            V + kv_seq_offsets
+            + kv_head_offsets
+            + kv_row_offsets
+            + kv_col_offsets,
             mask=kv_row_mask
                  & kv_col_mask,
             other=0
@@ -153,11 +166,12 @@ def prefill_gqa_attention_kernel(
     attn = accs_old / ls_old[:, :, None]
 
     tl.store(
-        O + q_row_offsets
+        O + q_seq_offsets
         + q_head_offsets
+        + q_row_offsets
         + q_col_offsets,
         value=attn,
-        mask=q_row_mask
-        & q_head_mask
+        mask=q_head_mask
+        & q_row_mask
         & q_col_mask
     )
