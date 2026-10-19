@@ -6,7 +6,7 @@ import torch.nn.functional as F
 import triton
 from torch.profiler import profile, ProfilerActivity
 
-from attn import prefill_gqa_attention
+from benchmarks.bench_utils import single_seq_prefill
 
 H_Q, H_KV, D = 14, 2, 64
 EXTRA = 64   # cache'in T'den sonraki boş kısmı
@@ -49,7 +49,7 @@ if __name__ == "__main__":
         ref = reference(q, k, v)
         row = f"  T={T:>5}"
         for BM in BLOCK_MS:
-            err = (prefill_gqa_attention(q, k, v, BLOCK_M=BM).float() - ref.float()).abs().max().item()
+            err = (single_seq_prefill(q, k, v, BLOCK_M=BM).float() - ref.float()).abs().max().item()
             row += f"  BM={BM}: {err:.1e}"
         print(row)
 
@@ -59,6 +59,6 @@ if __name__ == "__main__":
         q, k, v = make(T)
         row = f"  T={T:>5}  sdpa {triton.testing.do_bench(lambda: reference(q, k, v)):7.3f}"
         for BM in BLOCK_MS:
-            t = triton.testing.do_bench(lambda: prefill_gqa_attention(q, k, v, BLOCK_M=BM))
+            t = triton.testing.do_bench(lambda: single_seq_prefill(q, k, v, BLOCK_M=BM))
             row += f"  BM={BM} {t:7.3f}"
         print(row)

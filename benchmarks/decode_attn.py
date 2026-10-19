@@ -53,9 +53,9 @@ def benchmark(L, rng, H_q=14, H_kv=2, D=64, BLOCK_N=64, rounds=5):
     def run_triton(i):
         # kernel batch'li: B = 1
         return decode_gqa_attention(
-            qs[i][None], ks[i][None], vs[i][None], seq_len,
+            qs[i][None, None], ks[i][None], vs[i][None], seq_len,
             BLOCK_N=BLOCK_N, num_programs=num_programs
-        )[0]
+        )[0, 0]
 
     def make_torch(backend):
         def run(i):

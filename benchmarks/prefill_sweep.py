@@ -7,7 +7,7 @@ import torch
 import torch.nn.functional as F
 import triton
 
-from attn import prefill_gqa_attention
+from benchmarks.bench_utils import single_seq_prefill
 
 H_Q, H_KV, D = 14, 2, 64
 TS = [1024, 4096, 16384]
@@ -44,8 +44,8 @@ results = []
 for BM, BN, W in itertools.product(BLOCK_MS, BLOCK_NS, WARPS):
     cfg = dict(BLOCK_M=BM, BLOCK_N=BN, num_warps=W)
     try:
-        err = (prefill_gqa_attention(q_chk, k_chk, v_chk, **cfg).float() - ref_chk.float()).abs().max().item()
-        times = {T: triton.testing.do_bench(lambda: prefill_gqa_attention(*data[T], **cfg)) for T in TS}
+        err = (single_seq_prefill(q_chk, k_chk, v_chk, **cfg).float() - ref_chk.float()).abs().max().item()
+        times = {T: triton.testing.do_bench(lambda: single_seq_prefill(*data[T], **cfg)) for T in TS}
     except Exception as e:
         print(f"BM={BM:>3} BN={BN:>3} W={W}: HATA {type(e).__name__}: {str(e).splitlines()[0][:80]}")
         continue
