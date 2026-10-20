@@ -4,10 +4,11 @@ import matplotlib.pyplot as plt
 import torch
 from transformers import AutoTokenizer, AutoModelForCausalLM
 
-from main import (
+from generation.common import (
     MODEL_ID, tokenize, get_eos_token_ids, run_benchmarks, summarize,
-    stats_header, stats_row, eos_cell, IMPL_LABELS, IMPL_FNS
+    stats_header, stats_row, eos_cell
 )
+from main import IMPL_LABELS, IMPL_FNS
 
 FILLER = (
     "A GPU executes threads in groups called warps. "

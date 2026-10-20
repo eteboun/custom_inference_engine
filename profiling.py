@@ -3,7 +3,8 @@ import argparse
 import torch
 from transformers import AutoTokenizer, AutoModelForCausalLM
 
-from main import MODEL_ID, IMPL_FNS, tokenize, get_eos_token_ids
+from generation.common import MODEL_ID, tokenize, get_eos_token_ids
+from main import IMPL_FNS
 
 # nsys ile profillemek için küçük config
 # manuel decode CUDA graph replay olarak çalışır, graph içindeki kernel'leri
