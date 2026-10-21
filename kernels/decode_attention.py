@@ -12,7 +12,8 @@ import triton.language as tl
 @triton.jit
 def decode_gqa_attention_kernel_load(
     Q, K, V,
-    SEQ_LEN,
+    LENS,
+    SLOT_IDS,
     partial_m, partial_l, partial_acc,
     stride_kv_batch,
     stride_kv_head,
@@ -28,11 +29,15 @@ def decode_gqa_attention_kernel_load(
 
     partition_idx = tl.program_id(0)
     kv_head_idx = tl.program_id(1)
-    batch_idx = tl.program_id(2)
+    seq_idx = tl.program_id(2)
     P = tl.num_programs(0)
 
+    slot_id = tl.load(
+        SLOT_IDS + seq_idx
+    )
+
     L = tl.load(
-        SEQ_LEN + batch_idx
+        LENS + seq_idx
     ).to(tl.int32)
 
     qkv_cols = tl.arange(0, BLOCK_D)
@@ -40,7 +45,7 @@ def decode_gqa_attention_kernel_load(
     qkv_col_mask = qkv_cols[None, :] < D
 
     q_heads = tl.arange(0, BLOCK_G)
-    q_batch_offsets = batch_idx * Q_HEADS * D
+    q_batch_offsets = seq_idx * Q_HEADS * D
     q_head_offsets = (kv_head_idx * GROUP_SIZE + q_heads)[:, None] * D
     q_head_mask = q_heads[:, None] < GROUP_SIZE
 
@@ -59,7 +64,7 @@ def decode_gqa_attention_kernel_load(
     accs_old = tl.full((BLOCK_G, BLOCK_D), 0.0, tl.float32)
 
     kv_rows = tl.arange(0, BLOCK_N)
-    kv_batch_offsets = batch_idx * stride_kv_batch
+    kv_batch_offsets = slot_id * stride_kv_batch
     kv_head_offsets = kv_head_idx * stride_kv_head
 
     for start in range(
@@ -127,7 +132,7 @@ def decode_gqa_attention_kernel_load(
     # partial_m, partial_l: (B, H_q, P)
     # partial_acc: (B, H_q, P, D)
 
-    ml_batch_offsets = batch_idx * Q_HEADS * P
+    ml_batch_offsets = seq_idx * Q_HEADS * P
     ml_head_offsets = (kv_head_idx * GROUP_SIZE + q_heads) * P
     ml_partition_offsets = partition_idx
     ml_head_mask = q_heads < GROUP_SIZE
@@ -148,7 +153,7 @@ def decode_gqa_attention_kernel_load(
         mask=ml_head_mask
     )
 
-    acc_batch_offsets = batch_idx * Q_HEADS * P * D
+    acc_batch_offsets = seq_idx * Q_HEADS * P * D
     acc_head_offsets = (kv_head_idx * GROUP_SIZE + q_heads)[:, None] * P * D
     acc_partition_offsets = partition_idx * D
 

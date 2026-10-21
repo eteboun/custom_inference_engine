@@ -19,7 +19,7 @@ PROFILE_CONFIG = {
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument(
-        "--impls", nargs="+", choices=IMPL_FNS.keys(), default=["manual_inductor_triton_attn"]
+        "--impls", nargs="+", choices=IMPL_FNS.keys(), default=["vllm"]
     )
     impl_names = parser.parse_args().impls
 

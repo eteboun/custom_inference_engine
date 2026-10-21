@@ -13,6 +13,7 @@ def prefill_gqa_attention_kernel(
     O,
     CAP,
     CU_SEQLENS,
+    SLOT_IDS,
     D: tl.constexpr,
     Q_HEADS: tl.constexpr,
     KV_HEADS: tl.constexpr,
@@ -28,6 +29,10 @@ def prefill_gqa_attention_kernel(
     tile_idx = tl.program_id(0)
     kv_head_idx = tl.program_id(1)
     seq_idx = tl.program_id(2)
+
+    slot_id = tl.load(
+        SLOT_IDS + seq_idx
+    )
 
     seq_start = tl.load(CU_SEQLENS + seq_idx)
     seq_end = tl.load(CU_SEQLENS + seq_idx + 1)
@@ -68,7 +73,7 @@ def prefill_gqa_attention_kernel(
     )
 
     kv_rows = tl.arange(0, BLOCK_N)
-    kv_seq_offsets = seq_idx * KV_HEADS * CAP * D
+    kv_seq_offsets = slot_id * KV_HEADS * CAP * D
     kv_head_offsets = kv_head_idx * CAP * D
     kv_col_offsets = cols[None, :]
     kv_col_mask = cols[None, :] < D

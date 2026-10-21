@@ -5,19 +5,16 @@ from generation.common import (
     MODEL_ID, tokenize, get_eos_token_ids, run_benchmarks, summarize,
     stats_header, stats_row, eos_cell
 )
-from generation.generate import generate_manual
 from generation.vllm_generate import generate_vllm
 
 
 IMPL_LABELS = {
     "vllm": "vLLM (LLMEngine, varsayılan ayarlar)",
-    "manual_inductor_triton_attn": "manual + inductor + Triton attention + CUDA graph",
 }
 
 
 IMPL_FNS = {
     "vllm": generate_vllm,
-    "manual_inductor_triton_attn": generate_manual,
 }
 
 

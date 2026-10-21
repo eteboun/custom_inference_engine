@@ -16,10 +16,13 @@ def use_triton_attention(model):
 
 class DecodeGraph:
 
-    def __init__(self, model, max_len, batch_size=1, warmup_iters=3):
+    def __init__(self, model, max_len, n_slots, batch_size=1, warmup_iters=3):
         self.model = model
         self.batch_size = batch_size
         self.max_len = max_len
+        self.n_slots = n_slots
+        _slot_ids = list(range(1, n_slots))
+
         device = model.device
 
         with torch.inference_mode():
@@ -30,7 +33,7 @@ class DecodeGraph:
                 (1, batch_size), device=device, dtype=torch.long
             )
             self.kv_cache = KVCacheManager(
-                model.config, max_len, batch_size, device, model.dtype
+                model.config, max_len, batch_size, n_slots, device, model.dtype
             )
 
             use_triton_attention(model)
@@ -38,7 +41,7 @@ class DecodeGraph:
             side_stream = torch.cuda.Stream()
             side_stream.wait_stream(torch.cuda.current_stream())
             with torch.cuda.stream(side_stream):
-                self.kv_cache.reset()
+                self.kv_cache.reset(_slot_ids)
                 self.kv_cache.prepare_decode()
                 self._forward()
 
@@ -47,7 +50,7 @@ class DecodeGraph:
                 )
 
                 for _ in range(warmup_iters):
-                    self.kv_cache.reset()
+                    self.kv_cache.reset(_slot_ids)
                     self.kv_cache.prepare_decode()
                     forward()
             torch.cuda.current_stream().wait_stream(side_stream)
@@ -120,86 +123,59 @@ def get_prefill_fn(model):
     return _prefill_fns[model]
 
 
-def generate_batch(model, prompts, eos_token_ids, max_new_tokens=10, on_step=None):
-    B = len(prompts)
-    if B == 0 or max_new_tokens <= 0:
-        return [[] for _ in prompts]
-    if any(len(p) == 0 for p in prompts):
-        raise ValueError("boş prompt desteklenmiyor")
+def pad_slot_ids(slot_ids: list[int], batch_size: int, unused_slot: int):
+    missing = batch_size - len(slot_ids)
+    if missing < 0:
+        raise ValueError(
+            "more elements than batch size"
+        )
+    elif missing == 0:
+        return slot_ids
+    else:
+        return slot_ids + [unused_slot] * missing
 
-    bucket = decode_bucket(B)
-    prompts = list(prompts) + [[0]] * (bucket - B)
-    lens_list = [len(p) for p in prompts]
-    T = max(lens_list)
+def run_slots(
+        slot_ids: list[int],
+        graph: DecodeGraph
+) -> list[int]:
 
-    with torch.inference_mode():
-        use_triton_attention(model)
-        decode_graph = get_decode_graph(model, bucket)
-        kv_cache = decode_graph.kv_cache
-        device = model.device
+    if not slot_ids:
+        return []
 
-        if T + max_new_tokens > decode_graph.max_len:
-            raise ValueError(
-                f"prompt + yeni token ({T} + {max_new_tokens}) dizi başına KV cache "
-                f"kapasitesini ({decode_graph.max_len}, batch {bucket}) aşıyor"
-            )
+    kv_cache = graph.kv_cache
+    batch_size, unused_slot = kv_cache.batch_size, kv_cache.unused_slot
 
-        input_ids = torch.tensor(
-            [t for p in prompts for t in p], device=device
-        )[None]
-        total_T = input_ids.shape[1]
+    if not all(kv_cache.occupancy[slot_ids].tolist()):
+        return []
 
-        kv_cache.reset()
-        kv_cache.prepare_prefill(lens_list)
-        position_ids = kv_cache.pos[None]
+    padded_slot_ids = pad_slot_ids(slot_ids, batch_size, unused_slot)
+    last_position_ids = kv_cache.start[padded_slot_ids]
+    last_generated = kv_cache.last_generated[padded_slot_ids]
 
-        prefill = get_prefill_fn(model) if COMPILE_PREFILL else prefill_forward
-        if COMPILE_PREFILL and total_T > 1:
-            torch._dynamo.mark_dynamic(input_ids, 1)
-            torch._dynamo.mark_dynamic(position_ids, 1)
-            torch._dynamo.mark_dynamic(kv_cache.pos, 0)
-            torch._dynamo.mark_dynamic(kv_cache.seq_idx, 0)
-        logits = prefill(model, input_ids, position_ids, kv_cache)
-        kv_cache.advance()
+    graph.static_position_ids.copy_(
+        last_position_ids[None]
+    )
+    graph.static_token.copy_(
+        last_generated[None]
+    )
+    kv_cache.write_slot_ids(slot_ids)
 
-        outputs = [[] for _ in range(B)]
-        finished = [False] * B
+    logits = graph.replay()
+    next_tokens = torch.argmax(logits, dim=-1)
+    tokens = next_tokens[:len(slot_ids)].tolist()
 
-        with nvtx.range("manual_batch_decode"):
-            for step in range(max_new_tokens):
-                next_tokens = torch.argmax(logits, dim=-1)
-
-                tokens = next_tokens[:B].tolist()
-
-                if on_step is not None:
-                    on_step()
-
-                for b, token in enumerate(tokens):
-                    if finished[b]:
-                        continue
-                    if token in eos_token_ids:
-                        finished[b] = True
-                    else:
-                        outputs[b].append(token)
-
-                if all(finished) or step == max_new_tokens - 1:
-                    break
-
-                decode_graph.static_token.copy_(next_tokens[None])
-                decode_graph.static_position_ids.copy_(kv_cache.start[None])
-
-                with nvtx.range("decode_forward"):
-                    logits = decode_graph.replay()
-
-    return outputs
+    kv_cache.last_generated[slot_ids] = tokens
+    return tokens
 
 
-def generate_manual(model, inputs, eos_token_ids, max_new_tokens=10, on_token=None):
-    if inputs["input_ids"].shape[0] != 1:
-        raise ValueError("sadece batch size 1")
-    if not inputs["attention_mask"].bool().all():
-        raise ValueError("prompt'ta pad desteklenmiyor")
-    return generate_batch(
-        model, [inputs["input_ids"][0].tolist()], eos_token_ids, max_new_tokens,
-        on_step=on_token
-    )[0]
+
+
+
+
+
+
+
+
+
+
+
