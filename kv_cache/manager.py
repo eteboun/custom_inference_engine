@@ -51,6 +51,10 @@ class KVCacheManager:
             self.batch_size, dtype=torch.long, device=self.device
         )
 
+        self.decode_seq_idx = torch.arange(
+            self.batch_size, dtype=torch.long, device=self.device
+        )
+
         self.pos = None
         self.seq_idx = None
         self.cu_seqlens = None
@@ -85,7 +89,7 @@ class KVCacheManager:
 
     def prepare_decode(self):
         self.lens = self.decode_lens
-        self.seq_idx = torch.arange(self.batch_size, device=self.device)
+        self.seq_idx = self.decode_seq_idx
         self.pos = self.start
         self.is_decode = True
 
