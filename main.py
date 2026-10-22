@@ -1,11 +1,11 @@
 import torch
 from transformers import AutoTokenizer, AutoModelForCausalLM
 
-from generation.common import (
+from common import (
     MODEL_ID, tokenize, get_eos_token_ids, run_benchmarks, summarize,
     stats_header, stats_row, eos_cell
 )
-from generation.vllm_generate import generate_vllm
+from vllm_baseline.vllm_generate import generate_vllm
 
 
 IMPL_LABELS = {

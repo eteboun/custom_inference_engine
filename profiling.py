@@ -3,7 +3,7 @@ import argparse
 import torch
 from transformers import AutoTokenizer, AutoModelForCausalLM
 
-from generation.common import MODEL_ID, tokenize, get_eos_token_ids
+from common import MODEL_ID, tokenize, get_eos_token_ids
 from main import IMPL_FNS
 
 # nsys ile profillemek için küçük config

@@ -1,0 +1,172 @@
+import torch
+import torch.nn.functional as F
+
+from attn.metadata import AttentionMetadata
+from kv_cache.storage import KVStorage
+from common import pad_slot_ids
+
+class PrefillModule:
+
+    def __init__(self, model, kv_cache: KVStorage, batch_size: int):
+        self.model = model
+        self.batch_size = batch_size
+        self.kv_cache = kv_cache
+
+        device = model.device
+        self.device = device
+
+        self.metadata = AttentionMetadata(
+            batch_size=batch_size,
+            max_seqlen=0,
+            device=device,
+            is_decode=False
+        )
+
+    @torch.compile(fullgraph=True)
+    def _prefill_forward(
+            self,
+            input_ids: torch.Tensor,
+            position_ids: torch.Tensor,
+            kv_cache: KVStorage
+    ) -> torch.Tensor:
+        hidden = self.model.model(
+            input_ids=input_ids,
+            position_ids=position_ids,
+            kv_manager=kv_cache,
+            use_cache=False,
+            metadata=self.metadata
+        ).last_hidden_state
+        return self.model.lm_head(hidden[0, self.metadata.cu_seqlens[1:] - 1])
+
+    def validate_prefill(
+            self,
+            lens_list: list[int],
+            slot_ids: list[int]
+    ):
+        if len(lens_list) != self.batch_size:
+            raise ValueError(
+                f"lens_list uzunluğu ({len(lens_list)}) batch_size'a ({self.batch_size}) eşit değil"
+            )
+        if len(slot_ids) != self.batch_size:
+            raise ValueError(
+                f"slot_ids uzunluğu ({len(slot_ids)}) batch_size'a ({self.batch_size}) eşit değil"
+            )
+        if any(length <= 0 for length in lens_list):
+            raise ValueError("lens_list'te pozitif olmayan uzunluk var")
+        if any(length > self.kv_cache.max_cache_len for length in lens_list):
+            raise ValueError(
+                f"lens_list'te max_cache_len'i ({self.kv_cache.max_cache_len}) aşan uzunluk var"
+            )
+        if any(not 0 <= slot < self.kv_cache.n_slots for slot in slot_ids):
+            raise ValueError(f"slot_ids'te [0, {self.kv_cache.n_slots}) dışında slot var")
+
+        real_slots = [slot for slot in slot_ids if slot != 0]
+        if len(real_slots) != len(set(real_slots)):
+            raise ValueError("slot_ids'te tekrar eden slot var")
+
+    def prepare_prefill(
+            self,
+            lens_list: list[int],
+            slot_ids: list[int]
+    ):
+        self.validate_prefill(lens_list, slot_ids)
+
+        total_T = sum(lens_list)
+        max_seqlen = max(lens_list)
+        lens = torch.tensor(
+            lens_list, dtype=torch.long, device=self.device
+        )
+        slot_ids = torch.tensor(
+            slot_ids, dtype=torch.long, device=self.device
+        )
+
+        cu_seqlens = F.pad(lens.cumsum(0), (1, 0))
+        extended_slot_ids = torch.repeat_interleave(
+            slot_ids,
+            lens,
+            dim=-1,
+            output_size=total_T
+        )
+
+        offsets = torch.arange(total_T, device=self.device) - torch.repeat_interleave(
+            cu_seqlens[:-1],
+            lens,
+            dim=-1,
+            output_size=total_T
+        )
+
+        pos = self.kv_cache.start[extended_slot_ids] + offsets
+
+        self.metadata.pos = pos
+        self.metadata.cu_seqlens = cu_seqlens
+        self.metadata.lens = lens
+
+        self.metadata.write_slot_ids(slot_ids)
+
+        self.metadata.active_slot_ids = extended_slot_ids
+        self.metadata.max_seqlen = max_seqlen
+
+    def forward(
+            self,
+            prompts: list[list[int]],
+            slot_ids: list[int]
+    ) -> list[int]:
+
+        if not slot_ids:
+            return []
+
+        batch_size, unused_slot = self.batch_size, self.kv_cache.unused_slot
+
+        if any(self.kv_cache.occupancy[slot_ids].tolist()):
+            return []
+
+        if len(prompts) != len(slot_ids):
+            raise ValueError(
+                "len(prompts) must equal len(slot_ids)."
+            )
+
+        padded_slot_ids = pad_slot_ids(slot_ids, batch_size, unused_slot)
+        self.kv_cache.reset(slot_ids)
+
+        prompts_size = len(prompts)
+        prompts = prompts + [[0] for _ in range(batch_size - prompts_size)]
+        lens_list = list(map(len, prompts))
+
+        self.prepare_prefill(lens_list, padded_slot_ids)
+
+        input_ids = torch.tensor([
+            id_
+            for p in prompts
+            for id_ in p
+        ], dtype=torch.long, device=self.kv_cache.device).unsqueeze(0)
+
+        position_ids = self.metadata.pos[None]
+
+        total_T = sum(lens_list)
+
+        with torch.inference_mode():
+            if total_T > 1:
+                torch._dynamo.mark_dynamic(input_ids, 1)
+                torch._dynamo.mark_dynamic(position_ids, 1)
+                torch._dynamo.mark_dynamic(self.metadata.active_slot_ids, 0)
+                torch._dynamo.mark_dynamic(self.metadata.pos, 0)
+
+            logits = self._prefill_forward(
+                input_ids=input_ids,
+                position_ids=position_ids,
+                kv_cache=self.kv_cache
+            )[:prompts_size]
+
+            next_tokens = torch.argmax(
+                logits,
+                dim=-1,
+            )
+
+            self.kv_cache.last_generated[slot_ids] = next_tokens
+            self.kv_cache.advance(
+                slot_ids=self.metadata.slot_ids,
+                lens=self.metadata.lens
+            )
+
+        return next_tokens.tolist()
+

@@ -2,7 +2,7 @@ import atexit
 import itertools
 import os
 
-from generation.common import MODEL_ID
+from common import MODEL_ID
 
 
 VLLM_GPU_MEMORY_UTILIZATION = 0.4

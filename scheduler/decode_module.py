@@ -1,0 +1,123 @@
+import torch
+
+from attn.core import replace_attention
+from attn.metadata import AttentionMetadata
+from common import pad_slot_ids
+from kv_cache.storage import KVStorage
+
+def use_triton_attention(model):
+    if not getattr(model, "_uses_triton_attention", False):
+        replace_attention(model)
+        model._uses_triton_attention = True
+
+class DecodeModule:
+
+    def __init__(self, model, kv_cache: KVStorage, batch_size: int, warmup_iters=3):
+        self.model = model
+        self.batch_size = batch_size
+        self.kv_cache = kv_cache
+
+        device = model.device
+        self.device = device
+
+        self.metadata = AttentionMetadata(
+            batch_size=batch_size,
+            max_seqlen=batch_size,
+            device=device,
+            is_decode=True
+        )
+
+        with torch.inference_mode():
+            self.static_token = torch.zeros(
+                (1, batch_size), device=device, dtype=torch.long
+            )
+            self.static_position_ids = torch.zeros(
+                (1, batch_size), device=device, dtype=torch.long
+            )
+
+            self.decode_lens = torch.ones(
+                (batch_size,), dtype=torch.long, device=device
+            )
+
+            use_triton_attention(model)
+
+            side_stream = torch.cuda.Stream()
+            side_stream.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(side_stream):
+                self.prepare_decode()
+                self._forward()
+
+                forward = torch.compile(
+                    self._forward, fullgraph=True, dynamic=False
+                )
+
+                for _ in range(warmup_iters):
+                    self.prepare_decode()
+                    forward()
+            torch.cuda.current_stream().wait_stream(side_stream)
+
+            self.graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(self.graph):
+                self.prepare_decode()
+                self.static_logits = forward().logits[0]
+
+    def _forward(self):
+        outputs = self.model(
+            input_ids=self.static_token,
+            position_ids=self.static_position_ids,
+            kv_manager=self.kv_cache,
+            logits_to_keep=0,
+            use_cache=False,
+            metadata=self.metadata
+        )
+        self.kv_cache.advance(
+            slot_ids=self.metadata.slot_ids,
+            lens=self.metadata.lens
+        )
+        return outputs
+
+    def upload(
+            self,
+            slot_ids: list[int]
+    ) -> None:
+        padded_slot_ids = pad_slot_ids(
+            slot_ids, self.batch_size, self.kv_cache.unused_slot
+        )
+        self.static_position_ids.copy_(
+            self.kv_cache.start[padded_slot_ids][None]
+        )
+        self.static_token.copy_(
+            self.kv_cache.last_generated[padded_slot_ids][None]
+        )
+        self.metadata.write_slot_ids(slot_ids)
+
+    def prepare_decode(self):
+        self.metadata.lens.copy_(self.decode_lens)
+        self.metadata.pos = self.kv_cache.start[self.metadata.slot_ids]
+        self.metadata.active_slot_ids = self.metadata.slot_ids
+
+    def replay(self):
+        self.graph.replay()
+        return self.static_logits
+
+    def forward(
+            self,
+            slot_ids: list[int]
+    ) -> list[int]:
+
+        if not slot_ids:
+            return []
+
+        kv_cache = self.kv_cache
+
+        if not all(kv_cache.occupancy[slot_ids].tolist()):
+            return []
+
+        self.upload(slot_ids)
+        logits = self.replay()
+        next_tokens = torch.argmax(logits, dim=-1)
+        tokens = next_tokens[:len(slot_ids)].tolist()
+
+        kv_cache.last_generated[slot_ids] = tokens
+        return tokens
+

@@ -150,6 +150,12 @@ class TritonQwen2Attention(torch.nn.Module):
                 past_key_values=past_key_values, **kwargs
             )
 
+        metadata = kwargs.get("metadata")
+        if metadata is None:
+            raise ValueError(
+                "'metadata' is required with custom kv_manager."
+            )
+
         # hidden_states: (1, totalT, hidden_size)
 
         attn = self.original
@@ -175,16 +181,20 @@ class TritonQwen2Attention(torch.nn.Module):
         )
 
         kv_manager.update(
-            self.layer_idx, key_states, value_states
+            self.layer_idx,
+            metadata.active_slot_ids,
+            metadata.pos,
+            key_states,
+            value_states
         )
 
-        if kv_manager.is_decode:
+        if metadata.is_decode:
             o = gqa_decode_attention_op(
                 query_states,
                 kv_manager.keys[self.layer_idx],
                 kv_manager.values[self.layer_idx],
-                kv_manager.pos + 1,
-                slot_ids=kv_manager.slot_ids
+                metadata.pos + 1,
+                slot_ids=metadata.slot_ids
             )
 
         else:
@@ -192,8 +202,8 @@ class TritonQwen2Attention(torch.nn.Module):
                 query_states,
                 kv_manager.keys[self.layer_idx],
                 kv_manager.values[self.layer_idx],
-                max_seqlen=kv_manager.max_seqlen, cu_seqlens=kv_manager.cu_seqlens,
-                slot_ids=kv_manager.slot_ids
+                max_seqlen=metadata.max_seqlen, cu_seqlens=metadata.cu_seqlens,
+                slot_ids=metadata.slot_ids
             )
 
         attn_output = attn.o_proj(o.reshape(1, total_T, self.num_heads * self.head_dim))
