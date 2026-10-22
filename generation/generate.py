@@ -64,6 +64,18 @@ class DecodeGraph:
         self.kv_cache.advance()
         return outputs
 
+    def upload(self, slot_ids: list[int]) -> None:
+        padded_slot_ids = pad_slot_ids(
+            slot_ids, self.kv_cache.batch_size, self.kv_cache.unused_slot
+        )
+        self.static_position_ids.copy_(
+            self.kv_cache.start[padded_slot_ids][None]
+        )
+        self.static_token.copy_(
+            self.kv_cache.last_generated[padded_slot_ids][None]
+        )
+        self.kv_cache.write_slot_ids(slot_ids)
+
     def replay(self):
         with nvtx.range("manual_graph_replay"):
             self.graph.replay()
@@ -172,23 +184,11 @@ class Scheduler:
             return []
 
         kv_cache = graph.kv_cache
-        batch_size, unused_slot = kv_cache.batch_size, kv_cache.unused_slot
 
         if not all(kv_cache.occupancy[slot_ids].tolist()):
             return []
 
-        padded_slot_ids = pad_slot_ids(slot_ids, batch_size, unused_slot)
-        last_position_ids = kv_cache.start[padded_slot_ids]
-        last_generated = kv_cache.last_generated[padded_slot_ids]
-
-        graph.static_position_ids.copy_(
-            last_position_ids[None]
-        )
-        graph.static_token.copy_(
-            last_generated[None]
-        )
-        kv_cache.write_slot_ids(slot_ids)
-
+        graph.upload(slot_ids)
         logits = graph.replay()
         next_tokens = torch.argmax(logits, dim=-1)
         tokens = next_tokens[:len(slot_ids)].tolist()
@@ -200,13 +200,12 @@ class Scheduler:
             self,
             prompts: list[list[int]],
             slot_ids: list[int],
-            graph: DecodeGraph
+            kv_cache: KVCacheManager
     ) -> list[int]:
 
         if not slot_ids:
             return []
 
-        kv_cache = graph.kv_cache
         batch_size, unused_slot = kv_cache.batch_size, kv_cache.unused_slot
 
         if any(kv_cache.occupancy[slot_ids].tolist()):
