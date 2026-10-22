@@ -22,6 +22,11 @@ class PrefillModule:
             is_decode=False
         )
 
+        if batch_size > 1:
+            torch._dynamo.mark_dynamic(self.metadata.cu_seqlens, 0)
+            torch._dynamo.mark_dynamic(self.metadata.lens, 0)
+            torch._dynamo.mark_dynamic(self.metadata.slot_ids, 0)
+
     @torch.compile(fullgraph=True)
     def _prefill_forward(
             self,
@@ -98,13 +103,12 @@ class PrefillModule:
         pos = self.kv_cache.start[extended_slot_ids] + offsets
 
         self.metadata.pos = pos
-        self.metadata.cu_seqlens = cu_seqlens
-        self.metadata.lens = lens
-
-        self.metadata.write_slot_ids(slot_ids)
-
         self.metadata.active_slot_ids = extended_slot_ids
         self.metadata.max_seqlen = max_seqlen
+
+        self.metadata.write_cu_seqlens(cu_seqlens)
+        self.metadata.write_lens(lens)
+        self.metadata.write_slot_ids(slot_ids)
 
     def forward(
             self,
@@ -115,7 +119,7 @@ class PrefillModule:
         if not slot_ids:
             return []
 
-        batch_size, unused_slot = self.batch_size, self.kv_cache.unused_slot
+        unused_slot = self.kv_cache.unused_slot
 
         if any(self.kv_cache.occupancy[slot_ids].tolist()):
             return []
@@ -125,11 +129,11 @@ class PrefillModule:
                 "len(prompts) must equal len(slot_ids)."
             )
 
-        padded_slot_ids = pad_slot_ids(slot_ids, batch_size, unused_slot)
+        padded_slot_ids = pad_slot_ids(slot_ids, self.batch_size, unused_slot)
         self.kv_cache.reset(slot_ids)
 
         prompts_size = len(prompts)
-        prompts = prompts + [[0] for _ in range(batch_size - prompts_size)]
+        prompts = prompts + [[0] for _ in range(self.batch_size - prompts_size)]
         lens_list = list(map(len, prompts))
 
         self.prepare_prefill(lens_list, padded_slot_ids)
@@ -142,10 +146,8 @@ class PrefillModule:
 
         position_ids = self.metadata.pos[None]
 
-        total_T = sum(lens_list)
-
         with torch.inference_mode():
-            if total_T > 1:
+            if self.batch_size > 1:
                 torch._dynamo.mark_dynamic(input_ids, 1)
                 torch._dynamo.mark_dynamic(position_ids, 1)
                 torch._dynamo.mark_dynamic(self.metadata.active_slot_ids, 0)

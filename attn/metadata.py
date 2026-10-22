@@ -26,7 +26,20 @@ class AttentionMetadata:
         self.is_decode = is_decode
 
     def write_slot_ids(self, ids: list[int] | torch.Tensor):
+        ids = torch.as_tensor(ids, dtype=torch.long, device=self.slot_ids.device)
         s = len(ids)
         self.slot_ids[:s] = ids
         self.slot_ids[s:] = 0
+
+    def write_lens(self, lens: list[int] | torch.Tensor):
+        lens = torch.as_tensor(lens, dtype=torch.long, device=self.lens.device)
+        s = len(lens)
+        self.lens[:s] = lens
+        self.lens[s:] = 0
+
+    def write_cu_seqlens(self, cu_seqlens: list[int] | torch.Tensor):
+        cu_seqlens = torch.as_tensor(cu_seqlens, dtype=torch.long, device=self.cu_seqlens.device)
+        s = len(cu_seqlens)
+        self.cu_seqlens[:s] = cu_seqlens
+        self.cu_seqlens[s:] = cu_seqlens[-1]
 
