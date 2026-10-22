@@ -17,7 +17,6 @@ class DecodeGraph:
         self.batch_size = batch_size
         self.max_len = max_len
         self.n_slots = n_slots
-        _slot_ids = list(range(1, n_slots))
 
         device = model.device
 
@@ -37,7 +36,6 @@ class DecodeGraph:
             side_stream = torch.cuda.Stream()
             side_stream.wait_stream(torch.cuda.current_stream())
             with torch.cuda.stream(side_stream):
-                self.kv_cache.reset(_slot_ids)
                 self.kv_cache.prepare_decode()
                 self._forward()
 
@@ -46,7 +44,6 @@ class DecodeGraph:
                 )
 
                 for _ in range(warmup_iters):
-                    self.kv_cache.reset(_slot_ids)
                     self.kv_cache.prepare_decode()
                     forward()
             torch.cuda.current_stream().wait_stream(side_stream)
@@ -92,7 +89,7 @@ class Scheduler:
     def __init__(
             self,
             model,
-            eos_id: int,
+            eos_token_ids: set[int],
             max_new_tokens: int,
             n_slots: int
     ) -> None:
@@ -103,12 +100,17 @@ class Scheduler:
 
         if max_new_tokens <= 0:
             raise ValueError(
-                f"max_new_tokens must be positive."
+                "max_new_tokens must be positive."
+            )
+
+        if not eos_token_ids:
+            raise ValueError(
+                "eos_token_ids must not be empty."
             )
 
         if n_slots <= 0:
             raise ValueError(
-                f"n_slots must be positive."
+                "n_slots must be positive."
             )
 
         try:
@@ -123,7 +125,7 @@ class Scheduler:
         self.model = model
         self.max_new_tokens = max_new_tokens
         self.n_slots = n_slots
-        self.eos_id = eos_id
+        self.eos_token_ids = frozenset(eos_token_ids)
 
         self.decode_graphs = {}
 
@@ -138,7 +140,10 @@ class Scheduler:
     def _get_decode_graph(self, batch_size=1):
         if batch_size not in self.decode_graphs:
             self.decode_graphs[batch_size] = DecodeGraph(
-                self.model, self.KV_CACHE_CAPACITY // batch_size, batch_size
+                self.model,
+                max_len=self.KV_CACHE_CAPACITY // self.n_slots,
+                n_slots=self.n_slots,
+                batch_size=batch_size
             )
         return self.decode_graphs[batch_size]
 
@@ -209,7 +214,7 @@ class Scheduler:
 
         if len(prompts) != len(slot_ids):
             raise ValueError(
-                f"len(prompts) must equal len(slot_ids)."
+                "len(prompts) must equal len(slot_ids)."
             )
 
         padded_slot_ids = pad_slot_ids(slot_ids, batch_size, unused_slot)
