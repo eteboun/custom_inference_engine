@@ -1,6 +1,6 @@
 # GQA decode attention (tek query token): K/V P parçaya bölünür (split-KV),
 # load kernel'i parça başına kısmi softmax üretir, merge kernel'i birleştirir.
-# host: attn.decode_gqa_attention
+# host: attn.core.decode_gqa_attention
 import triton
 import triton.language as tl
 

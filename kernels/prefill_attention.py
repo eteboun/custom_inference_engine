@@ -1,7 +1,7 @@
-# GQA causal prefill attention (boş cache'ten, flash-attention tarzı): her program
+# GQA causal varlen prefill attention (boş slottan, flash-attention tarzı): her program
 # BLOCK_M token x bir kv head'in GROUP_SIZE q head'ini işler, K/V'yi causal sınıra kadar
 # blok blok gezer (online softmax), çıkışı doğrudan yazar.
-# host: attn.prefill_gqa_attention. modelde kullanılmıyor (bkz. attn.TritonQwen2Attention)
+# host: attn.core.prefill_gqa_attention
 # gövde ASCII olmalı, bkz. kernels/decode_attention.py'deki not
 import triton
 import triton.language as tl

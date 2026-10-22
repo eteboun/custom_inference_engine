@@ -1,5 +1,5 @@
 from typing import ClassVar
-from scheduler.decode_module import use_triton_attention
+from attn.core import use_triton_attention
 
 class Scheduler:
 

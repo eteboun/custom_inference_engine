@@ -1,14 +1,9 @@
 import torch
 
-from attn.core import replace_attention
+from attn.core import use_triton_attention
 from attn.metadata import AttentionMetadata
-from common import pad_slot_ids
+from scheduler.slots import pad_slot_ids
 from kv_cache.storage import KVStorage
-
-def use_triton_attention(model):
-    if not getattr(model, "_uses_triton_attention", False):
-        replace_attention(model)
-        model._uses_triton_attention = True
 
 class DecodeModule:
 

@@ -1,2 +1,2 @@
 # Triton kernel'leri (@triton.jit). host fonksiyonları (grid, buffer'lar, config)
-# ve model entegrasyonu attn.py'de
+# ve model entegrasyonu attn/core.py'de

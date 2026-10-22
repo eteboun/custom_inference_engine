@@ -216,3 +216,9 @@ def replace_attention(module):
             setattr(module, name, TritonQwen2Attention(child))
         elif not isinstance(child, TritonQwen2Attention):
             replace_attention(child)
+
+
+def use_triton_attention(model):
+    if not getattr(model, "_uses_triton_attention", False):
+        replace_attention(model)
+        model._uses_triton_attention = True

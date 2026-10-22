@@ -3,7 +3,7 @@ import torch.nn.functional as F
 
 from attn.metadata import AttentionMetadata
 from kv_cache.storage import KVStorage
-from common import pad_slot_ids
+from scheduler.slots import pad_slot_ids
 
 class PrefillModule:
 
