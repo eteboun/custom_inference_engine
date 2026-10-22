@@ -92,7 +92,7 @@ class DecodeModule:
         self.metadata.write_slot_ids(slot_ids)
 
     def prepare_decode(self):
-        self.metadata.lens.copy_(self.decode_lens)
+        self.metadata.write_lens(self.decode_lens)
         self.metadata.pos = self.kv_cache.start[self.metadata.slot_ids]
         self.metadata.active_slot_ids = self.metadata.slot_ids
 
