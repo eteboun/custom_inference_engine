@@ -105,11 +105,12 @@ class DecodeModule:
 
         kv_cache = self.kv_cache
 
-        self.upload(slot_ids)
-        logits = self.replay()
-        next_tokens = torch.argmax(logits, dim=-1)
-        tokens = next_tokens[:len(slot_ids)].tolist()
+        with torch.inference_mode():
+            self.upload(slot_ids)
+            logits = self.replay()
+            next_tokens = torch.argmax(logits, dim=-1)[:len(slot_ids)]
 
-        kv_cache.last_generated[slot_ids] = tokens
-        return tokens
+            kv_cache.last_generated[slot_ids] = next_tokens
+
+        return next_tokens.tolist()
 
