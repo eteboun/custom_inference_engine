@@ -51,10 +51,6 @@ class KVStorage:
             size=(n_slots,), dtype=torch.long, device=self.device
         )
 
-        self.occupancy = torch.zeros(
-            size=(n_slots,), dtype=torch.bool, device=self.device
-        )
-
     def update(
             self,
             layer_num: int,
@@ -79,9 +75,7 @@ class KVStorage:
             lens: torch.Tensor
     ) -> None:
         self.start[slot_ids] += lens
-        self.occupancy[slot_ids] = True
         self.start[self.unused_slot] = 0
-        self.occupancy[self.unused_slot] = False
 
     def validate_reset(self, slot_ids: list[int]):
         if any(not 0 < slot < self.n_slots for slot in slot_ids):
@@ -89,7 +83,6 @@ class KVStorage:
 
     def reset(self, slot_ids: list[int]) -> None:
         self.validate_reset(slot_ids)
-        self.occupancy[slot_ids] = False
         self.start[slot_ids] = 0
 
 

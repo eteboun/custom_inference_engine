@@ -105,9 +105,6 @@ class DecodeModule:
 
         kv_cache = self.kv_cache
 
-        if not all(kv_cache.occupancy[slot_ids].tolist()):
-            return []
-
         self.upload(slot_ids)
         logits = self.replay()
         next_tokens = torch.argmax(logits, dim=-1)

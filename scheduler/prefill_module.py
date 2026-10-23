@@ -121,9 +121,6 @@ class PrefillModule:
 
         unused_slot = self.kv_cache.unused_slot
 
-        if any(self.kv_cache.occupancy[slot_ids].tolist()):
-            return []
-
         if len(prompts) != len(slot_ids):
             raise ValueError(
                 "len(prompts) must equal len(slot_ids)."
