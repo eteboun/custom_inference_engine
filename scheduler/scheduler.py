@@ -13,6 +13,8 @@ class Scheduler:
     DECODE_BATCH_BUCKETS: ClassVar[tuple] = (1, 2, 4, 8, 16)
     KV_CACHE_CAPACITY: ClassVar[int] = 32768
 
+    SENTINEL: ClassVar[object] = object()
+
     def __init__(
             self,
             model,
@@ -79,6 +81,8 @@ class Scheduler:
             for i in range(self.n_slots)
         }
         self.new_tokens: dict[int, list[int]] = {}
+
+        self.open = True
 
     def _bucket_size(self, batch_size: int) -> int:
         for size in self.DECODE_BATCH_BUCKETS:
@@ -165,6 +169,10 @@ class Scheduler:
                 except queue.Empty:
                     break
 
+            if req is self.SENTINEL:
+                self.open = False
+                break
+
             prompt, fut = req
             self.futs[id_] = fut
 
@@ -186,8 +194,6 @@ class Scheduler:
 
     def _loop_decode(self) -> None:
         slot_ids = self._filled_slots()
-        if not slot_ids:
-            return
 
         bucket = self._get_bucket(
             batch_size=len(slot_ids)
@@ -199,6 +205,20 @@ class Scheduler:
         self._refresh_slots(
             slot_ids, next_tokens
         )
+
+    def _consume_queue(self, exc: Exception) -> None:
+        while True:
+            try:
+                req = self.requests.get_nowait()
+            except queue.Empty:
+                break
+
+            if req is self.SENTINEL:
+                self.open = False
+                continue
+
+            _, fut = req
+            fut.set_exception(exc)
 
     def _clear(self) -> None:
         self.futs = {
@@ -213,7 +233,12 @@ class Scheduler:
             fut = Future()
 
             l = len(prompt)
-            if l == 0:
+            if not self.open:
+                fut.set_exception(RuntimeError(
+                    "Loop is not open."
+                ))
+
+            elif l == 0:
                 fut.set_exception(ValueError(
                     "Empty prompts are not allowed."
                 ))
@@ -230,28 +255,33 @@ class Scheduler:
 
         return futs
 
+    def stop(self) -> None:
+        self.requests.put(self.SENTINEL)
+
     def loop(self) -> None:
 
         while True:
             try:
-                if len(self._filled_slots()) > 0:
-                    self._loop_prefill(False)
+                if self.open:
+                    if len(self._filled_slots()) > 0:
+                        self._loop_prefill(False)
 
-                else:
-                    self._loop_prefill(True)
+                    else:
+                        self._loop_prefill(True)
 
-                self._loop_decode()
+                if self._filled_slots():
+                    self._loop_decode()
+
+                elif not self.open:
+                    self._consume_queue(exc=RuntimeError(
+                        "Loop has been terminated."
+                    ))
+                    self._clear()
+                    break
 
             except Exception as exc:
                 for id_ in self._filled_slots():
                     self.futs[id_].set_exception(exc)
 
-                while True:
-                    try:
-                        _, fut = self.requests.get_nowait()
-                        fut.set_exception(exc)
-
-                    except queue.Empty:
-                        break
-
+                self._consume_queue(exc=exc)
                 self._clear()
