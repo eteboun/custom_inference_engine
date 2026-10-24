@@ -1,4 +1,5 @@
 import queue
+import time
 from concurrent.futures import Future
 
 import torch
@@ -80,7 +81,10 @@ class Scheduler:
             i: None
             for i in range(self.n_slots)
         }
+
         self.new_tokens: dict[int, list[int]] = {}
+        self.t_arrivals: dict[int, float] = {}
+        self.t_firsts: dict[int, float] = {}
 
         self.open = True
 
@@ -130,8 +134,9 @@ class Scheduler:
             slot_ids: list[int],
             next_tokens: list[int]
     ) -> None:
-
         finished_slots = []
+        current = time.perf_counter()
+
         for idx, token in enumerate(next_tokens):
             slot_id = slot_ids[idx]
 
@@ -139,19 +144,26 @@ class Scheduler:
                     token in self.eos_token_ids
                     or len(self.new_tokens.get(slot_id, [])) == self.max_new_tokens - 1
             ):
+                t_arrival = self.t_arrivals.pop(slot_id)
+                t_first = self.t_firsts.pop(slot_id, current)
+                new_tokens = self.new_tokens.pop(
+                    slot_id, []
+                ) + [token]
+
                 self.futs[slot_id].set_result(
-                    self.new_tokens.pop(
-                        slot_id, []
-                    ) + [token]
+                    (new_tokens, t_arrival, t_first, current)
                 )
 
                 self.futs[slot_id] = None
                 finished_slots.append(slot_id)
 
             else:
-                self.new_tokens.setdefault(
-                    slot_id, []
-                ).append(token)
+                if slot_id not in self.new_tokens:
+                    self.t_firsts[slot_id] = current
+                    self.new_tokens[slot_id] = [token]
+
+                else:
+                    self.new_tokens[slot_id].append(token)
 
         self.kv_cache.reset(finished_slots)
 
@@ -173,8 +185,9 @@ class Scheduler:
                 self.open = False
                 break
 
-            prompt, fut = req
+            prompt, fut, t_arrival = req
             self.futs[id_] = fut
+            self.t_arrivals[id_] = t_arrival
 
             prefill_prompts.append(prompt)
             prefill_slot_ids.append(id_)
@@ -217,7 +230,7 @@ class Scheduler:
                 self.open = False
                 continue
 
-            _, fut = req
+            _, fut, _ = req
             fut.set_exception(exc)
 
     def _clear(self) -> None:
@@ -226,9 +239,13 @@ class Scheduler:
             for i in range(self.n_slots)
         }
         self.new_tokens = {}
+        self.t_firsts = {}
+        self.t_arrivals = {}
 
     def call(self, batch: list[list[int]]) -> list[Future]:
         futs = []
+        t_arrival = time.perf_counter()
+
         for prompt in batch:
             fut = Future()
 
@@ -249,7 +266,7 @@ class Scheduler:
                 ))
 
             else:
-                self.requests.put((prompt, fut))
+                self.requests.put((prompt, fut, t_arrival))
 
             futs.append(fut)
 
