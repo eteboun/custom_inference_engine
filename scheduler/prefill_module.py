@@ -1,13 +1,15 @@
 import torch
 import torch.nn.functional as F
 
+import random
+
 from attn.metadata import AttentionMetadata
 from kv_cache.storage import KVStorage
 from scheduler.slots import pad_slot_ids
 
 class PrefillModule:
 
-    def __init__(self, model, kv_cache: KVStorage, batch_size: int):
+    def __init__(self, model, kv_cache: KVStorage, batch_size: int, warmup_iters: int = 3):
         self.model = model
         self.batch_size = batch_size
         self.kv_cache = kv_cache
@@ -26,6 +28,19 @@ class PrefillModule:
             torch._dynamo.mark_dynamic(self.metadata.cu_seqlens, 0)
             torch._dynamo.mark_dynamic(self.metadata.lens, 0)
             torch._dynamo.mark_dynamic(self.metadata.slot_ids, 0)
+
+        self.warmup(warmup_iters)
+
+    def warmup(self, warmup_iters: int) -> None:
+        slot_ids = list(range(1, min(self.batch_size, self.kv_cache.n_slots - 1) + 1))
+        max_len = min(128, self.kv_cache.max_cache_len)
+        rng = random.Random(0)
+
+        for _ in range(warmup_iters):
+            prompts = [[0] * rng.randint(2, max_len) for _ in slot_ids]
+            self.forward(prompts, slot_ids)
+
+        self.kv_cache.reset(slot_ids)
 
     @torch.compile(fullgraph=True)
     def _prefill_forward(
@@ -168,4 +183,3 @@ class PrefillModule:
             )
 
         return next_tokens.tolist()
-

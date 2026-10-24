@@ -71,7 +71,7 @@ class Scheduler:
             device=model.device,
             dtype=dtype
         )
-        self.buckets: dict[int, Bucket] = {}
+        self.buckets = self._generate_buckets()
         self.requests = queue.Queue()
 
         self.futs: dict[int, Future | None] = {
@@ -89,19 +89,23 @@ class Scheduler:
             "Invalid batch size."
         )
 
-    def _generate_bucket(self, batch_size: int) -> Bucket:
+    def _generate_buckets(self) -> dict[int, Bucket]:
+        buckets: dict[int, Bucket] = {}
+        for size in self.DECODE_BATCH_BUCKETS:
+            buckets[size] = Bucket(
+                model=self.model,
+                kv_cache=self.kv_cache,
+                batch_size=size
+            )
+
+            if size >= self.n_slots - 1:
+                break
+
+        return buckets
+
+    def _get_bucket(self, batch_size: int) -> Bucket:
         bucket_size = self._bucket_size(batch_size)
-        if bucket_size in self.buckets:
-            return self.buckets[bucket_size]
-
-        bucket = Bucket(
-            model=self.model,
-            kv_cache=self.kv_cache,
-            batch_size=bucket_size
-        )
-        self.buckets[bucket_size] = bucket
-
-        return bucket
+        return self.buckets[bucket_size]
 
     def _empty_slots(self) -> list[int]:
         return [
@@ -168,7 +172,9 @@ class Scheduler:
             prefill_slot_ids.append(id_)
 
         if prefill_prompts:
-            bucket = self._generate_bucket(len(prefill_prompts))
+            bucket = self._get_bucket(
+                batch_size=len(prefill_prompts)
+            )
             next_tokens = bucket.prefill_module.forward(
                 prompts=prefill_prompts,
                 slot_ids=prefill_slot_ids
@@ -183,7 +189,7 @@ class Scheduler:
         if not slot_ids:
             return
 
-        bucket = self._generate_bucket(
+        bucket = self._get_bucket(
             batch_size=len(slot_ids)
         )
         next_tokens = bucket.decode_module.forward(

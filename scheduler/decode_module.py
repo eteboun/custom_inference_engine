@@ -7,7 +7,7 @@ from kv_cache.storage import KVStorage
 
 class DecodeModule:
 
-    def __init__(self, model, kv_cache: KVStorage, batch_size: int, warmup_iters=3):
+    def __init__(self, model, kv_cache: KVStorage, batch_size: int, warmup_iters: int = 3):
         self.model = model
         self.batch_size = batch_size
         self.kv_cache = kv_cache
@@ -55,6 +55,13 @@ class DecodeModule:
             with torch.cuda.graph(self.graph):
                 self.prepare_decode()
                 self.static_logits = forward().logits[0]
+
+        self.warmup()
+
+    def warmup(self) -> None:
+        slot_ids = list(range(1, min(self.batch_size, self.kv_cache.n_slots - 1) + 1))
+        self.forward(slot_ids)
+        self.kv_cache.reset(slot_ids)
 
     def _forward(self):
         outputs = self.model(
