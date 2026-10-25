@@ -1,5 +1,6 @@
 import queue
 import time
+import math
 from concurrent.futures import Future
 
 import torch
@@ -22,6 +23,7 @@ class Scheduler:
             eos_token_ids: set[int],
             max_new_tokens: int,
             n_slots: int,
+            page_size: int,
             dtype: torch.dtype
     ) -> None:
 
@@ -33,13 +35,6 @@ class Scheduler:
         if n_slots - 1 > self.DECODE_BATCH_BUCKETS[-1]:
             raise ValueError(
                 "n_slots can't be larger than largest bucket size."
-            )
-
-        max_cache_len = self.KV_CACHE_CAPACITY // n_slots
-
-        if max_new_tokens > max_cache_len:
-            raise ValueError(
-                f"max_new_tokens can't be larger than max_cache_len {max_cache_len}."
             )
 
         if max_new_tokens <= 0:
@@ -63,29 +58,39 @@ class Scheduler:
 
         self.model = model
         self.max_new_tokens = max_new_tokens
-        self.max_cache_len = max_cache_len
         self.n_slots = n_slots
+        self.page_size = page_size
         self.eos_token_ids = frozenset(eos_token_ids)
 
         self.kv_cache = KVStorage(
             config=model.config,
-            max_cache_len=max_cache_len,
+            max_cache_len=self.KV_CACHE_CAPACITY,
             n_slots=n_slots,
+            page_size=page_size,
             device=model.device,
             dtype=dtype
         )
+        self.n_pages = self.kv_cache.n_pages
+
+        if self._required_pages(1) > self.n_pages - 1:
+            raise ValueError(
+                f"max_new_tokens can't need more than {self.n_pages - 1} pages."
+            )
+
         self.buckets = self._generate_buckets()
         self.requests = queue.Queue()
 
-        self.futs: dict[int, Future | None] = {
-            i: None
-            for i in range(self.n_slots)
-        }
+        self.futs: list[Future | None] = []
+        self.new_tokens: list[list[int]] = []
+        self.allocations: list[set] = []
+        self.lens: list[int] = []
+        self._init(self.n_slots)
 
-        self.new_tokens: dict[int, list[int]] = {}
         self.t_arrivals: dict[int, float] = {}
         self.t_firsts: dict[int, float] = {}
 
+        self.page_ids = set(range(self.n_pages))
+        self.slot_ids = set(range(self.n_slots))
         self.open = True
 
     def _bucket_size(self, batch_size: int) -> int:
@@ -115,19 +120,126 @@ class Scheduler:
         bucket_size = self._bucket_size(batch_size)
         return self.buckets[bucket_size]
 
+    @property
+    def _empty_pages(self) -> set[int]:
+        occupied_pages = set()
+
+        for pages in self.allocations:
+            occupied_pages.update(pages)
+
+        return self.page_ids - occupied_pages
+
+    @property
+    def _filled_pages(self) -> set[int]:
+        occupied_pages = set()
+
+        for pages in self.allocations:
+            occupied_pages.update(pages)
+
+        return occupied_pages - {self.kv_cache.unused_idx}
+
+    @property
     def _empty_slots(self) -> list[int]:
         return [
             i
-            for i in self.futs
-            if i != 0 and self.futs[i] is None
+            for i, fut in enumerate(self.futs)
+            if i != self.kv_cache.unused_idx and fut is None
         ]
 
+    @property
     def _filled_slots(self) -> list[int]:
         return [
             i
-            for i in self.futs
-            if i != 0 and self.futs[i] is not None
+            for i, fut in enumerate(self.futs)
+            if i != self.kv_cache.unused_idx and fut is not None
         ]
+
+    def _required_pages(self, prompt_len: int) -> int:
+        return math.ceil((prompt_len + self.max_new_tokens) / self.page_size)
+
+    def _validate_palloc(
+            self,
+            slot_ids: list[int],
+            page_counts: list[int]
+    ) -> list[int]:
+
+        if len(page_counts) != len(slot_ids):
+            raise RuntimeError(
+                "Unmatching page counts."
+            )
+
+        if any(id_ < 0 or id_ == self.kv_cache.unused_idx or id_ >= self.n_slots for id_ in slot_ids):
+            raise RuntimeError(
+                "Invalid slot ids."
+            )
+
+        if any(self.lens[id_] % self.page_size != 0 for id_ in slot_ids):
+            raise RuntimeError(
+                "Cannot allocate pages to slots with unfilled last page."
+            )
+
+        if any(
+                count <= 0
+                or count > self.n_pages - 1 - self.lens[id_] // self.page_size
+                for id_, count in zip(slot_ids, page_counts)
+        ):
+            raise RuntimeError(
+                "Invalid page counts."
+            )
+
+        empty_pages = list(self._empty_pages)
+        if sum(page_counts) > len(empty_pages):
+            raise RuntimeError(
+                "No enough pages to allocate."
+            )
+
+        return empty_pages
+
+    def _palloc(
+            self,
+            slot_ids: list[int],
+            page_counts: list[int]
+    ) -> None:
+
+        empty_pages = self._validate_palloc(
+            slot_ids,
+            page_counts
+        )
+
+        cursor = 0
+        for id_, page_count in zip(slot_ids, page_counts):
+            next_ = self.lens[id_] // self.page_size
+            piece = empty_pages[cursor: cursor + page_count]
+
+            self.kv_cache.block_table[
+                id_, next_:next_ + page_count
+            ] = piece
+
+            self.allocations[id_].update(piece)
+
+            cursor += page_count
+
+    def _validate_pfree(
+            self,
+            slot_ids: list[int]
+    ) -> None:
+
+        if any(id_ < 0 or id_ == self.kv_cache.unused_idx or id_ >= self.n_slots for id_ in slot_ids):
+            raise RuntimeError(
+                "Invalid slot ids."
+            )
+
+        if any(not self.allocations[id_] for id_ in slot_ids):
+            raise RuntimeError(
+                "Cannot free a slot with no pages."
+            )
+
+    def _pfree(
+            self,
+            slot_ids: list[int]
+    ) -> None:
+        self._validate_pfree(slot_ids)
+        self._clear(slot_ids)
 
     def _refresh_slots(
             self,
@@ -142,30 +254,27 @@ class Scheduler:
 
             if (
                     token in self.eos_token_ids
-                    or len(self.new_tokens.get(slot_id, [])) == self.max_new_tokens - 1
+                    or len(self.new_tokens[slot_id]) == self.max_new_tokens - 1
             ):
-                t_arrival = self.t_arrivals.pop(slot_id)
-                t_first = self.t_firsts.pop(slot_id, current)
-                new_tokens = self.new_tokens.pop(
-                    slot_id, []
-                ) + [token]
+                t_arrival = self.t_arrivals.get(slot_id)
+                t_first = self.t_firsts.get(slot_id, current)
+                new_tokens = self.new_tokens[slot_id] + [token]
 
                 self.futs[slot_id].set_result(
                     (new_tokens, t_arrival, t_first, current)
                 )
 
-                self.futs[slot_id] = None
                 finished_slots.append(slot_id)
 
             else:
-                if slot_id not in self.new_tokens:
+                if not self.new_tokens[slot_id]:
                     self.t_firsts[slot_id] = current
                     self.new_tokens[slot_id] = [token]
 
                 else:
                     self.new_tokens[slot_id].append(token)
 
-        self.kv_cache.reset(finished_slots)
+        self._pfree(finished_slots)
 
     def _loop_prefill(self, wait: bool) -> None:
         prefill_prompts: list[list[int]] = []
@@ -233,14 +342,38 @@ class Scheduler:
             _, fut, _ = req
             fut.set_exception(exc)
 
-    def _clear(self) -> None:
-        self.futs = {
-            i: None
-            for i in range(self.n_slots)
-        }
-        self.new_tokens = {}
-        self.t_firsts = {}
-        self.t_arrivals = {}
+    def _clear(self, ids: list[int] | None = None) -> None:
+
+        if ids is None:
+            self.futs.clear()
+            self.new_tokens.clear()
+            self.t_arrivals.clear()
+            self.t_firsts.clear()
+            self.allocations.clear()
+            self.lens.clear()
+            self.kv_cache.reset(list(self.slot_ids))
+            self._init(self.n_slots)
+
+        else:
+            for id_ in ids:
+                self.futs[id_] = None
+                self.new_tokens[id_] = []
+                self.t_arrivals.pop(id_, None)
+                self.t_firsts.pop(id_, None)
+                self.allocations[id_] = set()
+                self.lens[id_] = 0
+            self.kv_cache.reset(ids)
+
+    def _init(self, n_slots: int) -> None:
+        for i in range(n_slots):
+            self.futs.append(None)
+            self.new_tokens.append([])
+            self.allocations.append(
+                set()
+                if i != self.kv_cache.unused_idx
+                else {self.kv_cache.unused_idx}
+            )
+            self.lens.append(0)
 
     def call(self, batch: list[list[int]]) -> list[Future]:
         futs = []
@@ -260,9 +393,9 @@ class Scheduler:
                     "Empty prompts are not allowed."
                 ))
 
-            elif l + self.max_new_tokens > self.max_cache_len:
+            elif self._required_pages(l) > self.n_pages - 1:
                 fut.set_exception(ValueError(
-                    "Possible amount of tokens exceeds max_cache_len."
+                    "Possible amount of tokens exceeds available pages."
                 ))
 
             else:

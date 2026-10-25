@@ -134,7 +134,7 @@ class PrefillModule:
         if not slot_ids:
             return []
 
-        unused_slot = self.kv_cache.unused_slot
+        unused_slot = self.kv_cache.unused_idx
 
         if len(prompts) != len(slot_ids):
             raise ValueError(

@@ -83,7 +83,7 @@ class DecodeModule:
             slot_ids: list[int]
     ) -> None:
         padded_slot_ids = pad_slot_ids(
-            slot_ids, self.batch_size, self.kv_cache.unused_slot
+            slot_ids, self.batch_size, self.kv_cache.unused_idx
         )
         self.static_position_ids.copy_(
             self.kv_cache.start[padded_slot_ids][None]
