@@ -10,17 +10,18 @@ from kernels.decode_attention import (
 from kernels.prefill_attention import prefill_gqa_attention_kernel
 
 
-def decode_gqa_attention(q, k, v, lens, slot_ids, num_programs, BLOCK_N=64, num_warps=4,
+def decode_gqa_attention(q, k, v, lens, slot_ids, block_table, num_programs, BLOCK_N=64, num_warps=4,
                          wrap=lambda kernel: kernel):
     total_T, H_q, D = q.shape[1:]
-    S, H_kv, cap, _ = k.shape
+    N_PAGES, H_kv, PAGE_SIZE, _ = k.shape
     B = slot_ids.shape[0]
     assert H_q % H_kv == 0
     assert lens.shape == (B,)
+    assert N_PAGES == block_table.shape[1]
     assert total_T == B
     assert q.is_contiguous()
     assert k.stride() == v.stride() and k.stride(3) == 1 and k.stride(2) == D
-    max_kv_offset = (S - 1) * k.stride(0) + (H_kv - 1) * k.stride(1) + cap * D
+    max_kv_offset = (N_PAGES - 1) * k.stride(0) + (H_kv - 1) * k.stride(1) + PAGE_SIZE * D
     assert max_kv_offset < 2**31, "K/V ofsetleri int32'ye sığmıyor"
     assert BLOCK_N >= 16, "tl.dot için BLOCK_N >= 16 olmalı"
     P = num_programs
@@ -37,16 +38,19 @@ def decode_gqa_attention(q, k, v, lens, slot_ids, num_programs, BLOCK_N=64, num_
         q, k, v,
         lens,
         slot_ids,
+        block_table,
         partial_m, partial_l, partial_acc,
         k.stride(0),
         k.stride(1),
+        PAGE_SIZE=PAGE_SIZE,
+        N_PAGES=N_PAGES,
         D=D,
         Q_HEADS=H_q,
         BLOCK_N=BLOCK_N,
         BLOCK_D=BLOCK_D,
         BLOCK_G=BLOCK_G,
         GROUP_SIZE=H_q // H_kv,
-        num_warps=num_warps,
+        num_warps=num_warps
     )
 
     wrap(decode_attention_kernel_merge)[(H_q, B)](
@@ -62,14 +66,15 @@ def decode_gqa_attention(q, k, v, lens, slot_ids, num_programs, BLOCK_N=64, num_
     return o
 
 
-def prefill_gqa_attention(q, k, v, max_seqlen: int, cu_seqlens, slot_ids, BLOCK_M=16, BLOCK_N=64, num_warps=4,
+def prefill_gqa_attention(q, k, v, max_seqlen: int, cu_seqlens, slot_ids, block_table, BLOCK_M=16, BLOCK_N=64, num_warps=4,
                           wrap=lambda kernel: kernel):
     total_T, H_q, D = q.shape[1:]
-    _, H_kv, cap, _ = k.shape
+    N_PAGES, H_kv, PAGE_SIZE, _ = k.shape
     B = slot_ids.shape[0]
     assert H_q % H_kv == 0
     assert cu_seqlens.shape == (B + 1,)
-    assert k.shape == v.shape and k.shape[3] == D and total_T <= B * cap
+    assert N_PAGES == block_table.shape[1]
+    assert k.shape == v.shape and k.shape[3] == D
     assert q.is_contiguous() and k.is_contiguous() and v.is_contiguous()
     GROUP_SIZE = H_q // H_kv
     BLOCK_D = triton.next_power_of_2(D)
@@ -81,11 +86,14 @@ def prefill_gqa_attention(q, k, v, max_seqlen: int, cu_seqlens, slot_ids, BLOCK_
     wrap(prefill_gqa_attention_kernel)[(triton.cdiv(max_seqlen, BLOCK_M), H_kv, B)](
         q, k, v,
         o,
-        CAP=cap,
         CU_SEQLENS=cu_seqlens,
         SLOT_IDS=slot_ids,
+        BLOCK_TABLE=block_table,
+        kv_page_stride=k.stride(0),
+        kv_head_stride=k.stride(1),
+        PAGE_SIZE=PAGE_SIZE,
+        N_PAGES=N_PAGES,
         D=D,
-        KV_HEADS=H_kv,
         Q_HEADS=H_q,
         BLOCK_M=BLOCK_M,
         BLOCK_N=BLOCK_N,
@@ -105,18 +113,20 @@ GQA_PREFILL_CONFIG = {"BLOCK_M": 16, "BLOCK_N": 64, "num_warps": 4}
 
 @triton_op("inference::gqa_decode_attention", mutates_args=())
 def gqa_decode_attention_op(
-    q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, lens: torch.Tensor, slot_ids: torch.Tensor
+    q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
+        lens: torch.Tensor, slot_ids: torch.Tensor, block_table: torch.Tensor
 ) -> torch.Tensor:
     return decode_gqa_attention(q, k, v,
-                                lens=lens, slot_ids=slot_ids,
+                                lens=lens, slot_ids=slot_ids, block_table=block_table,
                                 **GQA_DECODE_CONFIG, wrap=wrap_triton)
 
 @triton_op("inference::gqa_prefill_attention", mutates_args=())
 def gqa_prefill_attention_op(
-    q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, max_seqlen: int, cu_seqlens: torch.Tensor, slot_ids: torch.Tensor
+    q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
+        max_seqlen: int, cu_seqlens: torch.Tensor, slot_ids: torch.Tensor, block_table: torch.Tensor
 ) -> torch.Tensor:
     return prefill_gqa_attention(q, k, v, **GQA_PREFILL_CONFIG,
-                                 max_seqlen=max_seqlen, cu_seqlens=cu_seqlens,
+                                 max_seqlen=max_seqlen, cu_seqlens=cu_seqlens, block_table=block_table,
                                  slot_ids=slot_ids, wrap=wrap_triton)
 
 class TritonQwen2Attention(torch.nn.Module):
@@ -180,30 +190,38 @@ class TritonQwen2Attention(torch.nn.Module):
             unsqueeze_dim=2
         )
 
-        kv_manager.update(
-            self.layer_idx,
-            metadata.active_slot_ids,
-            metadata.pos,
-            key_states,
-            value_states
-        )
-
         if metadata.is_decode:
+            kv_manager.decode_update(
+                self.layer_idx,
+                metadata.slot_ids,
+                key_states,
+                value_states
+            )
+
             o = gqa_decode_attention_op(
                 query_states,
                 kv_manager.keys[self.layer_idx],
                 kv_manager.values[self.layer_idx],
-                metadata.pos + 1,
-                slot_ids=metadata.slot_ids
+                kv_manager.lens[metadata.slot_ids] + 1,
+                slot_ids=metadata.slot_ids,
+                block_table=kv_manager.block_table
             )
 
         else:
+            kv_manager.prefill_update(
+                self.layer_idx,
+                metadata.pages,
+                metadata.offsets,
+                key_states,
+                value_states
+            )
+
             o = gqa_prefill_attention_op(
                 query_states,
                 kv_manager.keys[self.layer_idx],
                 kv_manager.values[self.layer_idx],
                 max_seqlen=metadata.max_seqlen, cu_seqlens=metadata.cu_seqlens,
-                slot_ids=metadata.slot_ids
+                slot_ids=metadata.slot_ids, block_table=kv_manager.block_table
             )
 
         attn_output = attn.o_proj(o.reshape(1, total_T, self.num_heads * self.head_dim))

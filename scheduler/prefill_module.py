@@ -40,7 +40,7 @@ class PrefillModule:
             prompts = [[0] * rng.randint(2, max_len) for _ in slot_ids]
             self.forward(prompts, slot_ids)
 
-        self.kv_cache.reset(slot_ids)
+            self.kv_cache.reset(slot_ids)
 
     @torch.compile(fullgraph=True)
     def _prefill_forward(
@@ -108,22 +108,26 @@ class PrefillModule:
             output_size=total_T
         )
 
-        offsets = torch.arange(total_T, device=self.device) - torch.repeat_interleave(
+        seq_offsets = torch.arange(total_T, device=self.device) - torch.repeat_interleave(
             cu_seqlens[:-1],
             lens,
             dim=-1,
             output_size=total_T
         )
 
-        pos = self.kv_cache.start[extended_slot_ids] + offsets
+        pos = self.kv_cache.lens[extended_slot_ids] + seq_offsets
 
-        self.metadata.pos = pos
-        self.metadata.active_slot_ids = extended_slot_ids
+        self.metadata.pages = self.kv_cache.block_table[
+            extended_slot_ids, pos // self.kv_cache.page_size
+        ]
+        self.metadata.offsets = pos % self.kv_cache.page_size
         self.metadata.max_seqlen = max_seqlen
 
         self.metadata.write_cu_seqlens(cu_seqlens)
         self.metadata.write_lens(lens)
         self.metadata.write_slot_ids(slot_ids)
+
+        return pos
 
     def forward(
             self,
@@ -142,13 +146,10 @@ class PrefillModule:
             )
 
         padded_slot_ids = pad_slot_ids(slot_ids, self.batch_size, unused_slot)
-        self.kv_cache.reset(slot_ids)
 
         prompts_size = len(prompts)
         prompts = prompts + [[0] for _ in range(self.batch_size - prompts_size)]
         lens_list = list(map(len, prompts))
-
-        self.prepare_prefill(lens_list, padded_slot_ids)
 
         input_ids = torch.tensor([
             id_
@@ -156,14 +157,14 @@ class PrefillModule:
             for id_ in p
         ], dtype=torch.long, device=self.kv_cache.device).unsqueeze(0)
 
-        position_ids = self.metadata.pos[None]
+        position_ids = self.prepare_prefill(lens_list, padded_slot_ids)[None]
 
         with torch.inference_mode():
             if self.batch_size > 1:
                 torch._dynamo.mark_dynamic(input_ids, 1)
                 torch._dynamo.mark_dynamic(position_ids, 1)
-                torch._dynamo.mark_dynamic(self.metadata.active_slot_ids, 0)
-                torch._dynamo.mark_dynamic(self.metadata.pos, 0)
+                torch._dynamo.mark_dynamic(self.metadata.pages, 0)
+                torch._dynamo.mark_dynamic(self.metadata.offsets, 0)
 
             logits = self._prefill_forward(
                 input_ids=input_ids,
@@ -177,7 +178,7 @@ class PrefillModule:
             )
 
             self.kv_cache.last_generated[slot_ids] = next_tokens
-            self.kv_cache.advance(
+            self.kv_cache.prefill_advance(
                 slot_ids=self.metadata.slot_ids,
                 lens=self.metadata.lens
             )

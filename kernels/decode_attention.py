@@ -14,9 +14,12 @@ def decode_gqa_attention_kernel_load(
     Q, K, V,
     LENS,
     SLOT_IDS,
+    BLOCK_TABLE,
     partial_m, partial_l, partial_acc,
-    stride_kv_batch,
-    stride_kv_head,
+    kv_page_stride,
+    kv_head_stride,
+    PAGE_SIZE: tl.constexpr,
+    N_PAGES: tl.constexpr,
     D: tl.constexpr,
     Q_HEADS: tl.constexpr,
     BLOCK_N: tl.constexpr,
@@ -25,7 +28,7 @@ def decode_gqa_attention_kernel_load(
     GROUP_SIZE: tl.constexpr
 ):
     # Q: (total_T, H_q, D)
-    # KV: (B, H_kv, CAP, D)
+    # KV: (n_pages, H_kv, page_size, D)
 
     partition_idx = tl.program_id(0)
     kv_head_idx = tl.program_id(1)
@@ -64,8 +67,6 @@ def decode_gqa_attention_kernel_load(
     accs_old = tl.full((BLOCK_G, BLOCK_D), 0.0, tl.float32)
 
     kv_rows = tl.arange(0, BLOCK_N)
-    kv_batch_offsets = slot_id * stride_kv_batch
-    kv_head_offsets = kv_head_idx * stride_kv_head
 
     for start in range(
         partition_idx * BLOCK_N,
@@ -74,12 +75,22 @@ def decode_gqa_attention_kernel_load(
     ):
         rows = start + kv_rows
 
-        kv_row_offsets = rows[:, None] * D
+        logical_pages = rows // PAGE_SIZE
+        page_ids = tl.load(
+            BLOCK_TABLE + slot_id * N_PAGES + logical_pages,
+            mask=rows < L,
+            other=0
+        )
+        offsets = rows % PAGE_SIZE
+
+        kv_page_offsets = page_ids[:, None] * kv_page_stride
+        kv_head_offsets = kv_head_idx * kv_head_stride
+        kv_row_offsets = offsets[:, None] * D
         kv_row_mask = rows[:, None] < L
 
         # (BLOCK_N, BLOCK_D)
         k = tl.load(
-            K + kv_batch_offsets
+            K + kv_page_offsets
             + kv_head_offsets
             + kv_row_offsets
             + qkv_col_offsets,
@@ -90,7 +101,7 @@ def decode_gqa_attention_kernel_load(
 
         # (BLOCK_N, BLOCK_D)
         v = tl.load(
-            V + kv_batch_offsets
+            V + kv_page_offsets
             + kv_head_offsets
             + kv_row_offsets
             + qkv_col_offsets,

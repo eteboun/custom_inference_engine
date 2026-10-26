@@ -11,12 +11,15 @@ import triton.language as tl
 def prefill_gqa_attention_kernel(
     Q, K, V,
     O,
-    CAP,
     CU_SEQLENS,
     SLOT_IDS,
+    BLOCK_TABLE,
+    kv_page_stride,
+    kv_head_stride,
+    PAGE_SIZE: tl.constexpr,
+    N_PAGES: tl.constexpr,
     D: tl.constexpr,
     Q_HEADS: tl.constexpr,
-    KV_HEADS: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_D: tl.constexpr,
@@ -24,7 +27,7 @@ def prefill_gqa_attention_kernel(
     GROUP_SIZE: tl.constexpr
 ):
     # Q: (total_T, H_q, D)
-    # KV: (B, H_kv, CAP, D)
+    # KV: (n_pages, H_kv, page_size, D)
 
     tile_idx = tl.program_id(0)
     kv_head_idx = tl.program_id(1)
@@ -73,8 +76,6 @@ def prefill_gqa_attention_kernel(
     )
 
     kv_rows = tl.arange(0, BLOCK_N)
-    kv_seq_offsets = slot_id * KV_HEADS * CAP * D
-    kv_head_offsets = kv_head_idx * CAP * D
     kv_col_offsets = cols[None, :]
     kv_col_mask = cols[None, :] < D
 
@@ -89,12 +90,22 @@ def prefill_gqa_attention_kernel(
     ):
         rows = start + kv_rows
 
-        kv_row_offsets = rows[:, None] * D
-        kv_row_mask = rows[:, None] < CAP
+        logical_pages = rows // PAGE_SIZE
+        page_ids = tl.load(
+            BLOCK_TABLE + slot_id * N_PAGES + logical_pages,
+            mask=rows < L,
+            other=0
+        )
+        offsets = rows % PAGE_SIZE
+
+        kv_page_offsets = page_ids[:, None] * kv_page_stride
+        kv_head_offsets = kv_head_idx * kv_head_stride
+        kv_row_offsets = offsets[:, None] * D
+        kv_row_mask = rows[:, None] < L
 
         # (BLOCK_N, BLOCK_D)
         ks = tl.load(
-            K + kv_seq_offsets
+            K + kv_page_offsets
             + kv_head_offsets
             + kv_row_offsets
             + kv_col_offsets,
@@ -105,7 +116,7 @@ def prefill_gqa_attention_kernel(
 
         # (BLOCK_N, BLOCK_D)
         vs = tl.load(
-            V + kv_seq_offsets
+            V + kv_page_offsets
             + kv_head_offsets
             + kv_row_offsets
             + kv_col_offsets,

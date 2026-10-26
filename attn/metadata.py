@@ -19,10 +19,10 @@ class AttentionMetadata:
             (batch_size + 1,), dtype=torch.long, device=device
         )
 
-        self.pos = None
-        self.active_slot_ids = None
-        self.max_seqlen = max_seqlen
+        self.pages = None
+        self.offsets = None
 
+        self.max_seqlen = max_seqlen
         self.is_decode = is_decode
 
     def write_slot_ids(self, ids: list[int] | torch.Tensor):

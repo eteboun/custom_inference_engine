@@ -1,6 +1,5 @@
 import torch
 
-from attn.core import use_triton_attention
 from attn.metadata import AttentionMetadata
 from scheduler.slots import pad_slot_ids
 from kv_cache.storage import KVStorage
@@ -30,16 +29,9 @@ class DecodeModule:
                 (1, batch_size), device=device, dtype=torch.long
             )
 
-            self.decode_lens = torch.ones(
-                (batch_size,), dtype=torch.long, device=device
-            )
-
-            use_triton_attention(model)
-
             side_stream = torch.cuda.Stream()
             side_stream.wait_stream(torch.cuda.current_stream())
             with torch.cuda.stream(side_stream):
-                self.prepare_decode()
                 self._forward()
 
                 forward = torch.compile(
@@ -47,13 +39,11 @@ class DecodeModule:
                 )
 
                 for _ in range(warmup_iters):
-                    self.prepare_decode()
                     forward()
             torch.cuda.current_stream().wait_stream(side_stream)
 
             self.graph = torch.cuda.CUDAGraph()
             with torch.cuda.graph(self.graph):
-                self.prepare_decode()
                 self.static_logits = forward().logits[0]
 
         self.warmup()
@@ -72,9 +62,8 @@ class DecodeModule:
             use_cache=False,
             metadata=self.metadata
         )
-        self.kv_cache.advance(
-            slot_ids=self.metadata.slot_ids,
-            lens=self.metadata.lens
+        self.kv_cache.decode_advance(
+            slot_ids=self.metadata.slot_ids
         )
         return outputs
 
@@ -86,17 +75,12 @@ class DecodeModule:
             slot_ids, self.batch_size, self.kv_cache.unused_idx
         )
         self.static_position_ids.copy_(
-            self.kv_cache.start[padded_slot_ids][None]
+            self.kv_cache.lens[padded_slot_ids][None]
         )
         self.static_token.copy_(
             self.kv_cache.last_generated[padded_slot_ids][None]
         )
         self.metadata.write_slot_ids(slot_ids)
-
-    def prepare_decode(self):
-        self.metadata.write_lens(self.decode_lens)
-        self.metadata.pos = self.kv_cache.start[self.metadata.slot_ids]
-        self.metadata.active_slot_ids = self.metadata.slot_ids
 
     def replay(self):
         self.graph.replay()
