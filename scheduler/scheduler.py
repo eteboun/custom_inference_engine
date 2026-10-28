@@ -97,7 +97,13 @@ class Scheduler:
 
         self.page_ids = set(range(self.n_pages))
         self.slot_ids = set(range(self.n_slots))
+        self._reset_occupancy()
         self.open = True
+
+    def _reset_occupancy(self) -> None:
+        self._empty_pages: set[int] = self.page_ids - {self.kv_cache.unused_idx}
+        self._empty_slots: set[int] = self.slot_ids - {self.kv_cache.unused_idx}
+        self._filled_slots: set[int] = set()
 
     def _bucket_size(self, batch_size: int) -> int:
         for size in self.DECODE_BATCH_BUCKETS:
@@ -126,32 +132,6 @@ class Scheduler:
         bucket_size = self._bucket_size(batch_size)
         return self.buckets[bucket_size]
 
-    @property
-    def _empty_pages(self) -> set[int]:
-        occupied_pages = {self.kv_cache.unused_idx}
-
-        for req in self.slots:
-            if req is not None:
-                occupied_pages.update(req.pages)
-
-        return self.page_ids - occupied_pages
-
-    @property
-    def _empty_slots(self) -> list[int]:
-        return [
-            i
-            for i, req in enumerate(self.slots)
-            if i != self.kv_cache.unused_idx and req is None
-        ]
-
-    @property
-    def _filled_slots(self) -> list[int]:
-        return [
-            i
-            for i, req in enumerate(self.slots)
-            if i != self.kv_cache.unused_idx and req is not None
-        ]
-
     def _required_pages(
             self,
             prompt_len: int,
@@ -167,7 +147,7 @@ class Scheduler:
             self,
             slot_ids: list[int],
             page_counts: list[int]
-    ) -> list[int]:
+    ) -> None:
 
         if len(page_counts) != len(slot_ids):
             raise RuntimeError(
@@ -198,13 +178,10 @@ class Scheduler:
                 "Invalid page counts."
             )
 
-        empty_pages = list(self._empty_pages)
-        if sum(page_counts) > len(empty_pages):
+        if sum(page_counts) > len(self._empty_pages):
             raise RuntimeError(
                 "No enough pages to allocate."
             )
-
-        return empty_pages
 
     def _palloc(
             self,
@@ -212,25 +189,25 @@ class Scheduler:
             page_counts: list[int]
     ) -> None:
 
-        empty_pages = self._validate_palloc(
+        self._validate_palloc(
             slot_ids,
             page_counts
         )
 
-        cursor = 0
         for id_, page_count in zip(slot_ids, page_counts):
+            if page_count == 0:
+                continue
+
             req = self.slots[id_]
 
             next_ = len(req.pages)
-            piece = empty_pages[cursor: cursor + page_count]
+            piece = [self._empty_pages.pop() for _ in range(page_count)]
 
             self.kv_cache.block_table[
                 id_, next_:next_ + page_count
             ] = torch.tensor(piece, device=self.kv_cache.device)
 
             req.pages.update(piece)
-
-            cursor += page_count
 
     def _validate_pfree(
             self,
@@ -300,18 +277,16 @@ class Scheduler:
         self._pfree(finished_slots)
 
     def _preempt_slots(self, slot_ids: list[int]) -> None:
+        reqs = [self.slots[id_] for id_ in slot_ids]
+        self._clear(slot_ids)
 
-        for id_ in slot_ids:
-            req = self.slots[id_]
-
+        for req in reqs:
             req.prefilled = False
             req.kv_len = 0
             req.pages = set()
             req.budget = 0
 
             self.preempted.append(req)
-
-        self._clear(slot_ids)
 
     def _preempt_accepted_request(self, req: Request) -> None:
         self.preempted.append(req)
@@ -328,7 +303,7 @@ class Scheduler:
         new_required_pages: list[int] = []
         new_budgets: list[int] = []
 
-        for id_ in self._empty_slots:
+        for id_ in sorted(self._empty_slots):
 
             if rem_budget <= 0:
                 break
@@ -368,6 +343,8 @@ class Scheduler:
 
             self.slot_listing_order.append(id_)
             self.slots[id_] = req
+            self._empty_slots.discard(id_)
+            self._filled_slots.add(id_)
 
             new_slot_ids.append(id_)
             new_required_pages.append(required_pages)
@@ -403,10 +380,17 @@ class Scheduler:
             ]
             self.slot_listing_order.clear()
             self.kv_cache.reset(list(self.slot_ids))
+            self._reset_occupancy()
 
         else:
             for id_ in ids:
+                req = self.slots[id_]
+                if req is not None:
+                    self._empty_pages.update(req.pages)
+
                 self.slots[id_] = None
+                self._filled_slots.discard(id_)
+                self._empty_slots.add(id_)
                 if id_ in self.slot_listing_order:
                     self.slot_listing_order.remove(id_)
             self.kv_cache.reset(ids)
