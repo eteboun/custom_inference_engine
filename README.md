@@ -120,15 +120,15 @@ so at most 16 requests run at once.
 64 requests, `max_new_tokens=128`, prompts of 30–50 tokens. Times are in ms; the `inf` row
 is all requests arriving at once.
 
-**Against vLLM at the same concurrency (16 requests)**: ours with `n_slots=17` (paged,
-before chunked prefill), vLLM with `max_num_seqs=16`:
+**Against vLLM at the same concurrency (16 requests)**: ours with `n_slots=17` and
+`token_budget=256` (current version), vLLM with `max_num_seqs=16`:
 
 | rate | tok/s (ours / vLLM) | ttft_mean | tpot_mean | e2e_mean |
 |---|---|---|---|---|
-| 2 | 146.4 / 146.0 | 16.0 / 38.4 | 5.93 / 7.24 | 512 / 645 |
-| 4 | 288.4 / 284.8 | 16.2 / 39.7 | 5.99 / 7.38 | 519 / 657 |
-| 8 | 551.9 / 543.0 | 16.4 / 40.1 | 6.35 / 7.79 | 550 / 693 |
-| inf | 1885.8 / 1490.7 | 830 / 1083 | 7.12 / 8.74 | 1426 / 1818 |
+| 2 | 146.5 / 146.0 | 15.3 / 38.4 | 5.90 / 7.24 | 509 / 645 |
+| 4 | 288.4 / 284.8 | 16.2 / 39.7 | 5.88 / 7.38 | 508 / 657 |
+| 8 | 553.6 / 543.0 | 16.1 / 40.1 | 6.06 / 7.79 | 523 / 693 |
+| inf | 1968.6 / 1490.7 | 809 / 1083 | 6.98 / 8.74 | 1374 / 1818 |
 
 **Across versions, at `inf` rate:**
 
@@ -138,6 +138,7 @@ before chunked prefill), vLLM with `max_num_seqs=16`:
 | paged KV | 5 | 586.0 | 4064 | 6.50 |
 | paged KV | 17 | 1885.8 | 830 | 7.12 |
 | paged KV + chunked prefill (`token_budget=256`) | 17 | 1833.4 | 863 | 7.48 |
+| + incrementally updated page/slot sets | 17 | 1968.6 | 809 | 6.98 |
 | vLLM default (no `max_num_seqs` limit) | – | 4763 | – | – |
 
 Notes:
@@ -147,8 +148,10 @@ Notes:
   size and throughput grows almost proportionally.
 - The prompts in this benchmark are shorter than the 256-token budget, so chunking never
   kicks in. The case chunked prefill helps with (a long prefill blocking decodes) does not
-  occur here; what remains is the extra host-side work and the cost of decodes taking the
-  graph-less path in mixed steps.
+  occur here.
+- Most of the slowdown that came with chunked prefill was host-side: free pages and slots
+  were rebuilt from every slot on each access. Keeping them as incrementally updated sets
+  recovered it and put the current version ahead of the one without chunked prefill.
 
 ## Known gaps
 
@@ -158,7 +161,6 @@ Notes:
 - The mixed forward does not use a CUDA graph; in every step with a prefill, decodes go
   through it too.
 - No profiling yet on whether short prefills should take a separate prefill + decode path
-  instead of mixed, or on reducing host-side cost.
+  instead of mixed.
 - The benchmark has no long-prompt workload.
-- `_empty_pages` rebuilds the page sets of all slots on every call.
 - Greedy sampling only; no prefix caching.
