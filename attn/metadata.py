@@ -5,7 +5,7 @@ class AttentionMetadata:
     def __init__(
             self,
             batch_size: int,
-            max_seqlen: int,
+            token_count: int,
             full_decode: bool,
             device: torch.device
     ):
@@ -16,10 +16,14 @@ class AttentionMetadata:
             (batch_size + 1,), dtype=torch.long, device=device
         )
 
-        self.pages = None
-        self.offsets = None
+        self.pages = torch.zeros(
+            (token_count,), dtype=torch.long, device=device
+        )
+        self.offsets = torch.zeros(
+            (token_count,), dtype=torch.long, device=device
+        )
 
-        self.max_seqlen = max_seqlen
+        self.max_seqlen = token_count
         self.full_decode = full_decode
 
     def write_slot_ids(self, ids: list[int] | torch.Tensor):
@@ -33,4 +37,16 @@ class AttentionMetadata:
         s = len(cu_seqlens)
         self.cu_seqlens[:s] = cu_seqlens
         self.cu_seqlens[s:] = cu_seqlens[-1]
+
+    def write_pages(self, pages: list[int] | torch.Tensor):
+        pages = torch.as_tensor(pages, dtype=torch.long, device=self.pages.device)
+        s = len(pages)
+        self.pages[:s] = pages
+        self.pages[s:] = 0
+
+    def write_offsets(self, offsets: list[int] | torch.Tensor):
+        offsets = torch.as_tensor(offsets, dtype=torch.long, device=self.offsets.device)
+        s = len(offsets)
+        self.offsets[:s] = offsets
+        self.offsets[s:] = 0
 

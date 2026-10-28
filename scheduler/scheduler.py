@@ -15,6 +15,7 @@ class Scheduler:
 
     DECODE_BATCH_BUCKETS: ClassVar[tuple] = (1, 2, 4, 8, 16)
     KV_CACHE_CAPACITY: ClassVar[int] = 32768
+    MIN_TOKEN_BUCKET: ClassVar[int] = 16
 
     SENTINEL: ClassVar[object] = object()
 
@@ -114,13 +115,30 @@ class Scheduler:
             "Invalid batch size."
         )
 
+    def _token_buckets(self) -> list[int]:
+        sizes = []
+        size = self.MIN_TOKEN_BUCKET
+        while size < self.token_budget:
+            sizes.append(size)
+            size *= 2
+
+        sizes.append(self.token_budget)
+        return sizes
+
     def _generate_buckets(self) -> dict[int, Bucket]:
+        token_counts = self._token_buckets()
+        torch._dynamo.config.recompile_limit = max(
+            torch._dynamo.config.recompile_limit,
+            len(self.DECODE_BATCH_BUCKETS) * len(token_counts)
+        )
+
         buckets: dict[int, Bucket] = {}
         for size in self.DECODE_BATCH_BUCKETS:
             buckets[size] = Bucket(
                 model=self.model,
                 kv_cache=self.kv_cache,
-                batch_size=size
+                batch_size=size,
+                token_counts=token_counts
             )
 
             if size >= self.n_slots - 1:
@@ -566,12 +584,9 @@ class Scheduler:
 
     def _process_slots(self) -> None:
 
-        filled_slots = self._filled_slots
-        bucket = self._get_bucket(len(filled_slots))
-
         input_slots = []
         kernel = "decode"
-        for id_ in filled_slots:
+        for id_ in self._filled_slots:
             req = self.slots[id_]
 
             if req.budget == 0:
@@ -581,6 +596,8 @@ class Scheduler:
                 kernel = "mixed"
 
             input_slots.append(id_)
+
+        bucket = self._get_bucket(len(input_slots))
 
         if kernel == "decode":
             new_tokens = bucket.decode_module.forward(
@@ -597,7 +614,10 @@ class Scheduler:
 
                 prompts.append(allocated)
 
-            new_tokens = bucket.mixed_module.forward(
+            mixed_module = bucket.get_mixed_module(
+                sum(map(len, prompts))
+            )
+            new_tokens = mixed_module.forward(
                 prompts=prompts,
                 slot_ids=input_slots
             )

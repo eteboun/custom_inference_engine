@@ -16,7 +16,7 @@ class DecodeModule:
 
         self.metadata = AttentionMetadata(
             batch_size=batch_size,
-            max_seqlen=batch_size,
+            token_count=batch_size,
             device=device,
             full_decode=True
         )
@@ -94,14 +94,11 @@ class DecodeModule:
         if not slot_ids:
             return []
 
-        kv_cache = self.kv_cache
-
         with torch.inference_mode():
             self.upload(slot_ids)
             logits = self.replay()
             next_tokens = torch.argmax(logits, dim=-1)[:len(slot_ids)]
 
-            kv_cache.last_generated[slot_ids] = next_tokens
+            self.kv_cache.last_generated[slot_ids] = next_tokens
 
         return next_tokens.tolist()
-
