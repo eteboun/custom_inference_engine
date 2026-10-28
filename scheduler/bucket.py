@@ -1,6 +1,6 @@
 from kv_cache.storage import KVStorage
 from scheduler.decode_module import DecodeModule
-from scheduler.prefill_module import PrefillModule
+from scheduler.mixed_module import MixedModule
 
 class Bucket:
     def __init__(self, model, kv_cache: KVStorage, batch_size: int):
@@ -12,7 +12,7 @@ class Bucket:
             batch_size=batch_size
         )
 
-        self.prefill_module = PrefillModule(
+        self.mixed_module = MixedModule(
             model=model,
             kv_cache=kv_cache,
             batch_size=batch_size

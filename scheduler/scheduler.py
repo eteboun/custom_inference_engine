@@ -25,6 +25,7 @@ class Scheduler:
             max_new_tokens: int,
             n_slots: int,
             page_size: int,
+            token_budget: int,
             dtype: torch.dtype
     ) -> None:
 
@@ -48,6 +49,11 @@ class Scheduler:
                 "eos_token_ids must not be empty."
             )
 
+        if token_budget <= n_slots - 1:
+            raise ValueError(
+                "token_budget must be greater than n_slots - 1."
+            )
+
         try:
             use_triton_attention(model)
 
@@ -61,6 +67,7 @@ class Scheduler:
         self.max_new_tokens = max_new_tokens
         self.n_slots = n_slots
         self.page_size = page_size
+        self.token_budget = token_budget
         self.eos_token_ids = frozenset(eos_token_ids)
 
         self.kv_cache = KVStorage(
@@ -130,16 +137,6 @@ class Scheduler:
         return self.page_ids - occupied_pages
 
     @property
-    def _filled_pages(self) -> set[int]:
-        occupied_pages = set()
-
-        for req in self.slots:
-            if req is not None:
-                occupied_pages.update(req.pages)
-
-        return occupied_pages - {self.kv_cache.unused_idx}
-
-    @property
     def _empty_slots(self) -> list[int]:
         return [
             i
@@ -183,15 +180,17 @@ class Scheduler:
             )
 
         if any(
-                not self.slots[id_].requires_page(self.page_size)
-                for id_ in slot_ids
+                self.slots[id_].prefilled
+                and page_counts[i] > 0
+                and not self.slots[id_].requires_page(self.page_size)
+                for i, id_ in enumerate(slot_ids)
         ):
             raise RuntimeError(
                 "Cannot allocate pages to slots with unfilled last page."
             )
 
         if any(
-                count <= 0
+                count < 0
                 or count > self.n_pages - 1 - len(self.slots[id_].pages)
                 for id_, count in zip(slot_ids, page_counts)
         ):
@@ -267,13 +266,13 @@ class Scheduler:
             slot_id = slot_ids[idx]
             req = self.slots[slot_id]
 
-            if not req.prefilled:
-                req.kv_len = (len(req.prompt)
-                              + len(req.new_tokens))
+            req.kv_len += req.budget
+
+            if not req.prefilled and req.kv_len == len(req.prompt) + len(req.new_tokens):
                 req.prefilled = True
 
-            else:
-                req.kv_len += 1
+            if not req.prefilled:
+                continue
 
             if (
                     token in self.eos_token_ids
@@ -300,11 +299,39 @@ class Scheduler:
 
         self._pfree(finished_slots)
 
-    def _loop_prefill(self, wait: bool, only_preempted: bool) -> None:
-        prefill_slot_ids: list[int] = []
-        prefill_required_pages: list[int] = []
+    def _preempt_slots(self, slot_ids: list[int]) -> None:
+
+        for id_ in slot_ids:
+            req = self.slots[id_]
+
+            req.prefilled = False
+            req.kv_len = 0
+            req.pages = set()
+            req.budget = 0
+
+            self.preempted.append(req)
+
+        self._clear(slot_ids)
+
+    def _preempt_accepted_request(self, req: Request) -> None:
+        self.preempted.append(req)
+
+    def _accept_requests(
+            self,
+            wait: bool,
+            only_preempted: bool,
+            rem_budget: int
+    ) -> tuple[
+        list[int], list[int], list[int]
+    ]:
+        new_slot_ids: list[int] = []
+        new_required_pages: list[int] = []
+        new_budgets: list[int] = []
 
         for id_ in self._empty_slots:
+
+            if rem_budget <= 0:
+                break
 
             if self.preempted:
                 req = self.preempted.pop()
@@ -327,100 +354,28 @@ class Scheduler:
                 self.open = False
                 break
 
+            prompt_len = len(req.prompt) + len(req.new_tokens)
+            required_budget = min(rem_budget, prompt_len)
+
             required_pages = self._required_pages(
-                len(req.prompt) + len(req.new_tokens),
+                required_budget,
                 total=False
             )
 
-            if required_pages > len(self._empty_pages) - sum(prefill_required_pages):
-                self.preempted.append(req)
+            if required_pages > len(self._empty_pages) - sum(new_required_pages):
+                self._preempt_accepted_request(req)
                 break
-
 
             self.slot_listing_order.append(id_)
             self.slots[id_] = req
 
-            prefill_required_pages.append(required_pages)
-            prefill_slot_ids.append(id_)
+            new_slot_ids.append(id_)
+            new_required_pages.append(required_pages)
+            new_budgets.append(required_budget)
 
-        if prefill_slot_ids:
+            rem_budget -= required_budget
 
-            self._palloc(
-                slot_ids=prefill_slot_ids,
-                page_counts=prefill_required_pages
-            )
-
-            bucket = self._get_bucket(
-                batch_size=len(prefill_slot_ids)
-            )
-
-            next_tokens = bucket.prefill_module.forward(
-                prompts=[self.slots[id_].prompt + self.slots[id_].new_tokens
-                         for id_ in prefill_slot_ids],
-                slot_ids=prefill_slot_ids
-            )
-
-            self._refresh_slots(
-                slot_ids=prefill_slot_ids,
-                next_tokens=next_tokens
-            )
-
-    def _pre_decode_palloc(self) -> None:
-        ps = self._decode_page_requiring_slots
-        ep = self._empty_pages
-
-        if len(ps) > len(ep):
-            self._free_n_pages(
-                len(ps) - len(ep)
-            )
-
-        ps = self._decode_page_requiring_slots
-        self._palloc(ps, [1] * len(ps))
-
-    def _loop_decode(self) -> None:
-        slot_ids = self._filled_slots
-
-        bucket = self._get_bucket(
-            batch_size=len(slot_ids)
-        )
-        next_tokens = bucket.decode_module.forward(
-            slot_ids=slot_ids
-        )
-
-        self._refresh_slots(
-            slot_ids=slot_ids,
-            next_tokens=next_tokens
-        )
-
-    @property
-    def _decode_page_requiring_slots(self) -> list[int]:
-        slots = []
-        for i in self._filled_slots:
-            if self.slots[i].requires_page(self.page_size):
-                slots.append(i)
-
-        return slots
-
-    def _free_n_pages(self, n: int) -> None:
-
-        slots = []
-        reqs = []
-        while n > 0:
-            last_slot_id = self.slot_listing_order.pop()
-            req = self.slots[last_slot_id]
-
-            n -= len(req.pages)
-
-            slots.append(last_slot_id)
-            reqs.append(req)
-            self.preempted.append(req)
-
-        self._pfree(slots)
-
-        for req in reqs:
-            req.kv_len = 0
-            req.pages = set()
-            req.prefilled = False
+        return new_slot_ids, new_required_pages, new_budgets
 
     def _consume_queue(self, exc: Exception) -> None:
         while True:
@@ -507,20 +462,34 @@ class Scheduler:
             try:
                 if self.open:
                     if self._filled_slots:
-                        self._pre_decode_palloc()
-                        self._loop_prefill(False, only_preempted=False)
+                        rem_budget = self._allocate_pages_pre_request()
+                        new = self._accept_requests(
+                            wait=False,
+                            only_preempted=False,
+                            rem_budget=rem_budget
+                        )
+                        self._allocate_pages_post_request(*new)
 
                     else:
-                        self._loop_prefill(True, only_preempted=False)
+                        new = self._accept_requests(
+                            wait=True,
+                            only_preempted=False,
+                            rem_budget=self.token_budget
+                        )
+                        self._allocate_pages_post_request(*new)
 
-                    if self._filled_slots:
-                        self._pre_decode_palloc()
-                        self._loop_decode()
+                    self._process_slots()
 
                 elif self._filled_slots or self.preempted:
-                    self._pre_decode_palloc()
-                    self._loop_prefill(False, only_preempted=True)
-                    self._loop_decode()
+                    rem_budget = self._allocate_pages_pre_request()
+                    new = self._accept_requests(
+                        wait=False,
+                        only_preempted=True,
+                        rem_budget=rem_budget
+                    )
+                    self._allocate_pages_post_request(*new)
+
+                    self._process_slots()
 
                 else:
                     exc = RuntimeError(
@@ -531,3 +500,125 @@ class Scheduler:
 
             except Exception as exc:
                 self._end(exc=exc)
+
+    def _allocate_pages_pre_request(self) -> int:
+
+        slot_ids = []
+        page_counts = []
+        budgets = []
+
+        current_budget = self.token_budget
+        for i in self.slot_listing_order:
+
+            slot_ids.append(i)
+
+            if current_budget <= 0:
+                budgets.append(0)
+                page_counts.append(0)
+                continue
+
+            req = self.slots[i]
+
+            if req.prefilled:
+
+                if req.requires_page(self.page_size):
+                    page_counts.append(1)
+
+                else:
+                    page_counts.append(0)
+
+                current_budget -= 1
+                budgets.append(1)
+
+            else:
+                allocated_budget = min(current_budget, req.uncached_token_count())
+                required_page_count = math.ceil(
+                    (req.kv_len + allocated_budget) / self.page_size
+                ) - len(req.pages)
+
+                page_counts.append(required_page_count)
+
+                current_budget -= allocated_budget
+                budgets.append(allocated_budget)
+
+        freed_page_count = 0
+        freed_slots = []
+        while len(self._empty_pages) + freed_page_count < sum(page_counts):
+
+            slot_id = slot_ids.pop()
+
+            freed_page_count += len(self.slots[slot_id].pages)
+            freed_slots.append(slot_id)
+
+            page_counts.pop()
+            current_budget += budgets.pop()
+
+        self._preempt_slots(
+            slot_ids=freed_slots
+        )
+        self._palloc(
+            slot_ids=slot_ids,
+            page_counts=page_counts
+        )
+
+        for i, id_ in enumerate(slot_ids):
+            self.slots[id_].budget = budgets[i]
+
+        return current_budget
+
+    def _allocate_pages_post_request(
+            self,
+            slot_ids: list[int],
+            page_counts: list[int],
+            budgets: list[int]
+    ) -> None:
+        for i, id_ in enumerate(slot_ids):
+            self.slots[id_].budget = budgets[i]
+
+        self._palloc(
+            slot_ids=slot_ids,
+            page_counts=page_counts
+        )
+
+    def _process_slots(self) -> None:
+
+        filled_slots = self._filled_slots
+        bucket = self._get_bucket(len(filled_slots))
+
+        input_slots = []
+        kernel = "decode"
+        for id_ in filled_slots:
+            req = self.slots[id_]
+
+            if req.budget == 0:
+                continue
+
+            if not req.prefilled:
+                kernel = "mixed"
+
+            input_slots.append(id_)
+
+        if kernel == "decode":
+            new_tokens = bucket.decode_module.forward(
+                slot_ids=input_slots
+            )
+
+        else:
+            prompts = []
+            for id_ in input_slots:
+                req = self.slots[id_]
+
+                full_prompt = req.prompt + req.new_tokens
+                allocated = full_prompt[req.kv_len: req.kv_len + req.budget]
+
+                prompts.append(allocated)
+
+            new_tokens = bucket.mixed_module.forward(
+                prompts=prompts,
+                slot_ids=input_slots
+            )
+
+        self._refresh_slots(
+            slot_ids=input_slots,
+            next_tokens=new_tokens
+        )

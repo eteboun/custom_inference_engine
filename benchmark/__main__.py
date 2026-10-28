@@ -19,6 +19,7 @@ def parse_args():
     parser.add_argument("--max-new-tokens", type=int, default=128)
     parser.add_argument("--n-slots", type=int, default=5)
     parser.add_argument("--page-size", type=int, default=16)
+    parser.add_argument("--token-budget", type=int, default=256)
     parser.add_argument("--max-num-seqs", type=int, default=None)
     parser.add_argument("--warmup-requests", type=int, default=8)
     parser.add_argument("--seed", type=int, default=0)
@@ -32,7 +33,8 @@ def make_ours_server(args, eos_token_ids):
     model = AutoModelForCausalLM.from_pretrained(
         MODEL_ID, dtype=torch.float16
     ).to("cuda").eval()
-    sched = Scheduler(model, eos_token_ids, args.max_new_tokens, args.n_slots, args.page_size, torch.float16)
+    sched = Scheduler(model, eos_token_ids, args.max_new_tokens, args.n_slots, args.page_size,
+                      args.token_budget, torch.float16)
     thread = threading.Thread(target=sched.loop, daemon=True)
     thread.start()
 

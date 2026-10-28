@@ -7,7 +7,7 @@ from attn.metadata import AttentionMetadata
 from kv_cache.storage import KVStorage
 from scheduler.slots import pad_slot_ids
 
-class PrefillModule:
+class MixedModule:
 
     def __init__(self, model, kv_cache: KVStorage, batch_size: int, warmup_iters: int = 3):
         self.model = model
@@ -21,12 +21,11 @@ class PrefillModule:
             batch_size=batch_size,
             max_seqlen=0,
             device=device,
-            is_decode=False
+            full_decode=False
         )
 
         if batch_size > 1:
             torch._dynamo.mark_dynamic(self.metadata.cu_seqlens, 0)
-            torch._dynamo.mark_dynamic(self.metadata.lens, 0)
             torch._dynamo.mark_dynamic(self.metadata.slot_ids, 0)
 
         self.warmup(warmup_iters)
@@ -43,7 +42,7 @@ class PrefillModule:
             self.kv_cache.reset(slot_ids)
 
     @torch.compile(fullgraph=True)
-    def _prefill_forward(
+    def _mixed_forward(
             self,
             input_ids: torch.Tensor,
             position_ids: torch.Tensor,
@@ -58,7 +57,7 @@ class PrefillModule:
         ).last_hidden_state
         return self.model.lm_head(hidden[0, self.metadata.cu_seqlens[1:] - 1])
 
-    def validate_prefill(
+    def validate_mixed(
             self,
             lens_list: list[int],
             slot_ids: list[int]
@@ -84,12 +83,12 @@ class PrefillModule:
         if len(real_slots) != len(set(real_slots)):
             raise ValueError("slot_ids'te tekrar eden slot var")
 
-    def prepare_prefill(
+    def prepare_mixed(
             self,
             lens_list: list[int],
             slot_ids: list[int]
     ):
-        self.validate_prefill(lens_list, slot_ids)
+        self.validate_mixed(lens_list, slot_ids)
 
         total_T = sum(lens_list)
         max_seqlen = max(lens_list)
@@ -124,7 +123,7 @@ class PrefillModule:
         self.metadata.max_seqlen = max_seqlen
 
         self.metadata.write_cu_seqlens(cu_seqlens)
-        self.metadata.write_lens(lens)
+        self.lens = lens
         self.metadata.write_slot_ids(slot_ids)
 
         return pos
@@ -157,7 +156,7 @@ class PrefillModule:
             for id_ in p
         ], dtype=torch.long, device=self.kv_cache.device).unsqueeze(0)
 
-        position_ids = self.prepare_prefill(lens_list, padded_slot_ids)[None]
+        position_ids = self.prepare_mixed(lens_list, padded_slot_ids)[None]
 
         with torch.inference_mode():
             if self.batch_size > 1:
@@ -166,7 +165,7 @@ class PrefillModule:
                 torch._dynamo.mark_dynamic(self.metadata.pages, 0)
                 torch._dynamo.mark_dynamic(self.metadata.offsets, 0)
 
-            logits = self._prefill_forward(
+            logits = self._mixed_forward(
                 input_ids=input_ids,
                 position_ids=position_ids,
                 kv_cache=self.kv_cache
@@ -178,9 +177,9 @@ class PrefillModule:
             )
 
             self.kv_cache.last_generated[slot_ids] = next_tokens
-            self.kv_cache.prefill_advance(
+            self.kv_cache.mixed_advance(
                 slot_ids=self.metadata.slot_ids,
-                lens=self.metadata.lens
+                lens=self.lens
             )
 
         return next_tokens.tolist()

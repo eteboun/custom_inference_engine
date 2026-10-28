@@ -59,7 +59,7 @@ class KVStorage:
             size=(n_slots,), dtype=torch.long, device=self.device
         )
 
-    def prefill_update(
+    def mixed_update(
             self,
             layer_num: int,
             pages: torch.Tensor,
@@ -128,7 +128,7 @@ class KVStorage:
         self.lens[slot_ids] += 1
         self.lens[self.unused_idx] = 0
 
-    def prefill_advance(
+    def mixed_advance(
             self,
             slot_ids: torch.Tensor,
             lens: torch.Tensor

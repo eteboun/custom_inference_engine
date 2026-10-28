@@ -18,7 +18,7 @@ class DecodeModule:
             batch_size=batch_size,
             max_seqlen=batch_size,
             device=device,
-            is_decode=True
+            full_decode=True
         )
 
         with torch.inference_mode():

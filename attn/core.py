@@ -7,7 +7,7 @@ from transformers.models.qwen2.modeling_qwen2 import Qwen2Attention, apply_rotar
 from kernels.decode_attention import (
     decode_gqa_attention_kernel_load, decode_attention_kernel_merge
 )
-from kernels.prefill_attention import prefill_gqa_attention_kernel
+from kernels.prefill_attention import mixed_gqa_attention_kernel
 
 
 def decode_gqa_attention(q, k, v, lens, slot_ids, block_table, num_programs, BLOCK_N=64, num_warps=4,
@@ -66,12 +66,16 @@ def decode_gqa_attention(q, k, v, lens, slot_ids, block_table, num_programs, BLO
     return o
 
 
-def prefill_gqa_attention(q, k, v, max_seqlen: int, cu_seqlens, slot_ids, block_table, BLOCK_M=16, BLOCK_N=64, num_warps=4,
-                          wrap=lambda kernel: kernel):
+def mixed_gqa_attention(q, k, v,
+                        max_seqlen: int, cu_seqlens, kv_lens,
+                        slot_ids, block_table,
+                        BLOCK_M=16, BLOCK_N=64, num_warps=4,
+                        wrap=lambda kernel: kernel):
     total_T, H_q, D = q.shape[1:]
     N_PAGES, H_kv, PAGE_SIZE, _ = k.shape
     B = slot_ids.shape[0]
     assert H_q % H_kv == 0
+    assert kv_lens.shape == (B,)
     assert cu_seqlens.shape == (B + 1,)
     assert N_PAGES == block_table.shape[1]
     assert k.shape == v.shape and k.shape[3] == D
@@ -83,11 +87,12 @@ def prefill_gqa_attention(q, k, v, max_seqlen: int, cu_seqlens, slot_ids, block_
 
     o = torch.empty_like(q)
 
-    wrap(prefill_gqa_attention_kernel)[(triton.cdiv(max_seqlen, BLOCK_M), H_kv, B)](
+    wrap(mixed_gqa_attention_kernel)[(triton.cdiv(max_seqlen, BLOCK_M), H_kv, B)](
         q, k, v,
         o,
         CU_SEQLENS=cu_seqlens,
         SLOT_IDS=slot_ids,
+        KV_LENS=kv_lens,
         BLOCK_TABLE=block_table,
         kv_page_stride=k.stride(0),
         kv_head_stride=k.stride(1),
@@ -120,14 +125,16 @@ def gqa_decode_attention_op(
                                 lens=lens, slot_ids=slot_ids, block_table=block_table,
                                 **GQA_DECODE_CONFIG, wrap=wrap_triton)
 
-@triton_op("inference::gqa_prefill_attention", mutates_args=())
-def gqa_prefill_attention_op(
+@triton_op("inference::gqa_mixed_attention", mutates_args=())
+def gqa_mixed_attention_op(
     q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
-        max_seqlen: int, cu_seqlens: torch.Tensor, slot_ids: torch.Tensor, block_table: torch.Tensor
+        max_seqlen: int, cu_seqlens: torch.Tensor, kv_lens: torch.Tensor,
+        slot_ids: torch.Tensor, block_table: torch.Tensor
 ) -> torch.Tensor:
-    return prefill_gqa_attention(q, k, v, **GQA_PREFILL_CONFIG,
-                                 max_seqlen=max_seqlen, cu_seqlens=cu_seqlens, block_table=block_table,
-                                 slot_ids=slot_ids, wrap=wrap_triton)
+    return mixed_gqa_attention(q, k, v, **GQA_PREFILL_CONFIG,
+                               max_seqlen=max_seqlen, cu_seqlens=cu_seqlens,
+                               block_table=block_table, kv_lens=kv_lens,
+                               slot_ids=slot_ids, wrap=wrap_triton)
 
 class TritonQwen2Attention(torch.nn.Module):
     def __init__(self, original_attn):
@@ -190,7 +197,7 @@ class TritonQwen2Attention(torch.nn.Module):
             unsqueeze_dim=2
         )
 
-        if metadata.is_decode:
+        if metadata.full_decode:
             kv_manager.decode_update(
                 self.layer_idx,
                 metadata.slot_ids,
@@ -208,7 +215,7 @@ class TritonQwen2Attention(torch.nn.Module):
             )
 
         else:
-            kv_manager.prefill_update(
+            kv_manager.mixed_update(
                 self.layer_idx,
                 metadata.pages,
                 metadata.offsets,
@@ -216,10 +223,11 @@ class TritonQwen2Attention(torch.nn.Module):
                 value_states
             )
 
-            o = gqa_prefill_attention_op(
+            o = gqa_mixed_attention_op(
                 query_states,
                 kv_manager.keys[self.layer_idx],
                 kv_manager.values[self.layer_idx],
+                kv_lens=kv_manager.lens[metadata.slot_ids],
                 max_seqlen=metadata.max_seqlen, cu_seqlens=metadata.cu_seqlens,
                 slot_ids=metadata.slot_ids, block_table=kv_manager.block_table
             )

@@ -1,18 +1,19 @@
-# GQA causal varlen prefill attention (boş slottan, flash-attention tarzı): her program
-# BLOCK_M token x bir kv head'in GROUP_SIZE q head'ini işler, K/V'yi causal sınıra kadar
-# blok blok gezer (online softmax), çıkışı doğrudan yazar.
-# host: attn.core.prefill_gqa_attention
+# GQA causal varlen mixed attention (chunked prefill + decode, KV_LENS'ten devam eden,
+# flash-attention tarzı): her program BLOCK_M token x bir kv head'in GROUP_SIZE q head'ini
+# işler, K/V'yi causal sınıra kadar blok blok gezer (online softmax), çıkışı doğrudan yazar.
+# host: attn.core.mixed_gqa_attention
 # gövde ASCII olmalı, bkz. kernels/decode_attention.py'deki not
 import triton
 import triton.language as tl
 
 
 @triton.jit
-def prefill_gqa_attention_kernel(
+def mixed_gqa_attention_kernel(
     Q, K, V,
     O,
     CU_SEQLENS,
     SLOT_IDS,
+    KV_LENS,
     BLOCK_TABLE,
     kv_page_stride,
     kv_head_stride,
@@ -35,6 +36,10 @@ def prefill_gqa_attention_kernel(
 
     slot_id = tl.load(
         SLOT_IDS + seq_idx
+    )
+
+    kv_len = tl.load(
+        KV_LENS + seq_idx
     )
 
     seq_start = tl.load(CU_SEQLENS + seq_idx)
@@ -79,7 +84,7 @@ def prefill_gqa_attention_kernel(
     kv_col_offsets = cols[None, :]
     kv_col_mask = cols[None, :] < D
 
-    end = tl.minimum(L, (tile_idx + 1) * BLOCK_M)
+    end = kv_len + tl.minimum(L, (tile_idx + 1) * BLOCK_M)
 
     ms_old = tl.full((BLOCK_M, BLOCK_G), -float("inf"), dtype=tl.float32)
     ls_old = tl.full((BLOCK_M, BLOCK_G), 0.0, dtype=tl.float32)
@@ -93,7 +98,7 @@ def prefill_gqa_attention_kernel(
         logical_pages = rows // PAGE_SIZE
         page_ids = tl.load(
             BLOCK_TABLE + slot_id * N_PAGES + logical_pages,
-            mask=rows < L,
+            mask=rows < kv_len + L,
             other=0
         )
         offsets = rows % PAGE_SIZE
@@ -101,7 +106,7 @@ def prefill_gqa_attention_kernel(
         kv_page_offsets = page_ids[:, None] * kv_page_stride
         kv_head_offsets = kv_head_idx * kv_head_stride
         kv_row_offsets = offsets[:, None] * D
-        kv_row_mask = rows[:, None] < L
+        kv_row_mask = rows[:, None] < kv_len + L
 
         # (BLOCK_N, BLOCK_D)
         ks = tl.load(
@@ -137,7 +142,7 @@ def prefill_gqa_attention_kernel(
         )
 
         # (BLOCK_M, 1, BLOCK_N)
-        causal_mask = ((tile_idx * BLOCK_M + q_rows)[:, None, None]
+        causal_mask = ((kv_len + tile_idx * BLOCK_M + q_rows)[:, None, None]
                        >= rows[None, None, :])
 
         # (BLOCK_M, BLOCK_G, BLOCK_N)
