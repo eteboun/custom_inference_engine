@@ -8,14 +8,16 @@ from typing import ClassVar
 from attn.core import use_triton_attention
 from scheduler.models import Request
 from kv_cache.storage import KVStorage
-from scheduler.bucket import Bucket
+from scheduler.graph_backend import FullGraphBackend, PiecewiseGraphBackend
 
 
 class Scheduler:
 
-    DECODE_BATCH_BUCKETS: ClassVar[tuple] = (1, 2, 4, 8, 16)
+    DECODE_BATCH_BUCKETS: ClassVar[tuple] = (1, 2, 4, 8, 16, 32)
     KV_CACHE_CAPACITY: ClassVar[int] = 32768
     MIN_TOKEN_BUCKET: ClassVar[int] = 16
+    FULL_GRAPH_TOKEN_THRESHOLD: ClassVar[int] = 128
+    PIECEWISE_TOKEN_STEP: ClassVar[int] = 32
 
     SENTINEL: ClassVar[object] = object()
 
@@ -55,6 +57,16 @@ class Scheduler:
                 "token_budget must be greater than n_slots - 1."
             )
 
+        if token_budget <= self.FULL_GRAPH_TOKEN_THRESHOLD:
+            raise ValueError(
+                "token_budget must be greater than FULL_GRAPH_TOKEN_THRESHOLD."
+            )
+
+        if token_budget % self.PIECEWISE_TOKEN_STEP != 0:
+            raise ValueError(
+                "token_budget must be a multiple of PIECEWISE_TOKEN_STEP."
+            )
+
         try:
             use_triton_attention(model)
 
@@ -86,7 +98,7 @@ class Scheduler:
                 f"max_new_tokens can't need more than {self.n_pages - 1} pages."
             )
 
-        self.buckets = self._generate_buckets()
+        self._generate_backends()
 
         self.requests = queue.Queue()
         self.preempted: list[Request] = []
@@ -106,49 +118,54 @@ class Scheduler:
         self._empty_slots: set[int] = self.slot_ids - {self.kv_cache.unused_idx}
         self._filled_slots: set[int] = set()
 
-    def _bucket_size(self, batch_size: int) -> int:
-        for size in self.DECODE_BATCH_BUCKETS:
-            if size >= batch_size:
-                return size
-
-        raise RuntimeError(
-            "Invalid batch size."
-        )
-
-    def _token_buckets(self) -> list[int]:
+    def _batch_buckets(self) -> list[int]:
         sizes = []
-        size = self.MIN_TOKEN_BUCKET
-        while size < self.token_budget:
-            sizes.append(size)
-            size *= 2
-
-        sizes.append(self.token_budget)
-        return sizes
-
-    def _generate_buckets(self) -> dict[int, Bucket]:
-        token_counts = self._token_buckets()
-        torch._dynamo.config.recompile_limit = max(
-            torch._dynamo.config.recompile_limit,
-            len(self.DECODE_BATCH_BUCKETS) * len(token_counts)
-        )
-
-        buckets: dict[int, Bucket] = {}
         for size in self.DECODE_BATCH_BUCKETS:
-            buckets[size] = Bucket(
-                model=self.model,
-                kv_cache=self.kv_cache,
-                batch_size=size,
-                token_counts=token_counts
-            )
-
+            sizes.append(size)
             if size >= self.n_slots - 1:
                 break
 
-        return buckets
+        return sizes
 
-    def _get_bucket(self, batch_size: int) -> Bucket:
-        bucket_size = self._bucket_size(batch_size)
-        return self.buckets[bucket_size]
+    def _full_token_buckets(self) -> list[int]:
+        sizes = []
+        size = self.MIN_TOKEN_BUCKET
+        while size < self.FULL_GRAPH_TOKEN_THRESHOLD:
+            sizes.append(size)
+            size *= 2
+
+        sizes.append(self.FULL_GRAPH_TOKEN_THRESHOLD)
+        return sizes
+
+    def _piecewise_token_buckets(self) -> list[int]:
+        return list(range(
+            self.FULL_GRAPH_TOKEN_THRESHOLD + self.PIECEWISE_TOKEN_STEP,
+            self.token_budget + self.PIECEWISE_TOKEN_STEP,
+            self.PIECEWISE_TOKEN_STEP
+        ))
+
+    def _generate_backends(self) -> None:
+        batch_sizes = self._batch_buckets()
+        full_token_counts = self._full_token_buckets()
+        piecewise_token_counts = self._piecewise_token_buckets()
+
+        torch._dynamo.config.recompile_limit = max(
+            torch._dynamo.config.recompile_limit,
+            len(batch_sizes) * len(full_token_counts)
+            + 2 * len(piecewise_token_counts)
+        )
+
+        self.full_backend = FullGraphBackend(
+            model=self.model,
+            kv_cache=self.kv_cache,
+            batch_sizes=batch_sizes,
+            token_counts=full_token_counts
+        )
+        self.piecewise_backend = PiecewiseGraphBackend(
+            model=self.model,
+            kv_cache=self.kv_cache,
+            token_counts=piecewise_token_counts
+        )
 
     def _required_pages(
             self,
@@ -597,10 +614,11 @@ class Scheduler:
 
             input_slots.append(id_)
 
-        bucket = self._get_bucket(len(input_slots))
-
         if kernel == "decode":
-            new_tokens = bucket.decode_module.forward(
+            decode_module = self.full_backend.get_decode_module(
+                len(input_slots)
+            )
+            new_tokens = decode_module.forward(
                 slot_ids=input_slots
             )
 
@@ -614,9 +632,16 @@ class Scheduler:
 
                 prompts.append(allocated)
 
-            mixed_module = bucket.get_mixed_module(
-                sum(map(len, prompts))
-            )
+            token_count = sum(map(len, prompts))
+            if token_count <= self.FULL_GRAPH_TOKEN_THRESHOLD:
+                mixed_module = self.full_backend.get_mixed_module(
+                    len(input_slots), token_count
+                )
+            else:
+                mixed_module = self.piecewise_backend.get_mixed_module(
+                    token_count
+                )
+
             new_tokens = mixed_module.forward(
                 prompts=prompts,
                 slot_ids=input_slots

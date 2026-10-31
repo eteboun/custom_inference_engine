@@ -15,11 +15,11 @@ class DecodeModule:
         self.device = device
 
         self.metadata = AttentionMetadata(
-            batch_size=batch_size,
             token_count=batch_size,
             device=device,
             full_decode=True
         )
+        self.metadata.prepare_full_graph(batch_size)
 
         with torch.inference_mode():
             self.static_token = torch.zeros(

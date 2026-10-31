@@ -51,14 +51,40 @@ def compute_metrics(records):
     }
 
 
+def _strip_eos(tokens, eos_token_ids):
+    while tokens and tokens[-1] in eos_token_ids:
+        tokens = tokens[:-1]
+    return tokens
+
+
+def compute_accuracy(records, refs, eos_token_ids):
+    exact = 0
+    prefix_ratios = []
+    for r, ref in zip(records, refs):
+        ours = _strip_eos(r["tokens"], eos_token_ids)
+        ref = _strip_eos(ref, eos_token_ids)
+        exact += ours == ref
+
+        n = 0
+        while n < min(len(ours), len(ref)) and ours[n] == ref[n]:
+            n += 1
+        prefix_ratios.append(n / max(len(ours), len(ref), 1))
+
+    return {
+        "exact_match": exact / len(records),
+        "prefix_match": statistics.mean(prefix_ratios),
+    }
+
+
 def table_header():
     cols = "".join(f"{m + '_' + s:>11}" for m, s in METRIC_COLUMNS)
-    return f"{'rate':>6}{'req/s':>8}{'tok/s':>9}{'new_tok':>9}{cols}"
+    return f"{'rate':>6}{'req/s':>8}{'tok/s':>9}{'new_tok':>9}{cols}{'exact%':>8}{'prefix%':>9}"
 
 
-def table_row(rate, m):
+def table_row(rate, m, acc):
     cols = "".join(f"{m[metric][stat] * 1000:>11.2f}" for metric, stat in METRIC_COLUMNS)
     return (
         f"{rate:>6g}{m['req_per_s']:>8.2f}{m['tok_per_s']:>9.1f}"
         f"{m['mean_new_tokens']:>9.1f}{cols}"
+        f"{acc['exact_match'] * 100:>8.1f}{acc['prefix_match'] * 100:>9.1f}"
     )
