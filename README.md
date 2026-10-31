@@ -140,6 +140,13 @@ relative to the longer output); trailing EOS tokens are ignored.
 
 ## Results
 
+> These are not strict or carefully designed benchmarks. They are temporary measurements
+> taken while developing individual features, to check that a change works and roughly how
+> it affects performance. Each configuration is a single run on a laptop GPU under WSL, with
+> no repeated runs, no confidence intervals and no control over background load, and the
+> workloads are small and synthetic. Treat the numbers as rough indications, not as a
+> performance claim.
+
 64 requests, `max_new_tokens=128`, prompts of 30–50 tokens. Times are in ms; the `inf` row
 is all requests arriving at once.
 
