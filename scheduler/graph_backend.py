@@ -6,7 +6,7 @@ from scheduler.mixed_module import FullMixedModule, PiecewiseMixedModule
 
 
 def _smallest_fit(sizes, value: int) -> int:
-    for size in sizes:
+    for size in sorted(sizes):
         if size >= value:
             return size
 
@@ -22,29 +22,32 @@ class FullGraphBackend:
             model,
             kv_cache: KVStorage,
             batch_sizes: list[int],
-            token_counts: list[int]
+            token_counts: list[int],
+            pool
     ) -> None:
-        self.decode_modules = {
-            batch_size: DecodeModule(
-                model=model,
-                kv_cache=kv_cache,
-                batch_size=batch_size
-            )
-            for batch_size in batch_sizes
-        }
-
         self.mixed_modules = {
             batch_size: {
                 token_count: FullMixedModule(
                     model=model,
                     kv_cache=kv_cache,
                     batch_size=batch_size,
-                    token_count=token_count
+                    token_count=token_count,
+                    pool=pool
                 )
-                for token_count in token_counts
+                for token_count in reversed(token_counts)
                 if token_count >= batch_size or token_count == token_counts[-1]
             }
-            for batch_size in batch_sizes
+            for batch_size in reversed(batch_sizes)
+        }
+
+        self.decode_modules = {
+            batch_size: DecodeModule(
+                model=model,
+                kv_cache=kv_cache,
+                batch_size=batch_size,
+                pool=pool
+            )
+            for batch_size in reversed(batch_sizes)
         }
 
     def get_decode_module(self, batch_size: int) -> DecodeModule:
@@ -65,7 +68,8 @@ class PiecewiseGraphBackend:
             self,
             model,
             kv_cache: KVStorage,
-            token_counts: list[int]
+            token_counts: list[int],
+            pool
     ) -> None:
         self.buffer = torch.zeros(
             (1, max(token_counts),
@@ -79,9 +83,10 @@ class PiecewiseGraphBackend:
                 model=model,
                 kv_cache=kv_cache,
                 token_count=token_count,
-                buffer=self.buffer
+                buffer=self.buffer,
+                pool=pool
             )
-            for token_count in token_counts
+            for token_count in reversed(token_counts)
         }
 
     def get_mixed_module(self, token_count: int) -> PiecewiseMixedModule:

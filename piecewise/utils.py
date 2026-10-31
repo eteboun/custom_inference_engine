@@ -37,6 +37,20 @@ def is_graph_piece(submod) -> bool:
     return not any(is_attention(n) for n in submod.graph.nodes)
 
 
+def weak_ref(x):
+    if isinstance(x, torch.Tensor):
+        storage = x.untyped_storage()
+        storage = torch._C._construct_storage_from_data_pointer(
+            storage.data_ptr(), x.device, storage.nbytes()
+        )
+        return torch.empty(0, dtype=x.dtype, device=x.device).set_(
+            storage, x.storage_offset(), x.size(), x.stride()
+        )
+    if isinstance(x, (tuple, list)):
+        return type(x)(weak_ref(v) for v in x)
+    return x
+
+
 def fake_inputs(submod) -> list:
     values = []
     for node in submod.graph.nodes:

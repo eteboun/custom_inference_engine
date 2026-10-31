@@ -79,12 +79,28 @@ Every forward replays CUDA graphs captured at init. Two backends hold them:
     all buckets.
 
   Attention runs outside the graphs, so there is no batch padding. `slot_ids` and `cu_seqlens`
-  get the real batch size each step and are marked dynamic. Each bucket compiles at most twice:
-  once for `B >= 2` and once for `B = 1`.
+  get the real batch size each step and are marked dynamic. Each bucket has two Dynamo
+  entries, one for `B >= 2` and one for `B = 1` (0/1 specialization); both are created at init
+  by warming up with several sequences and then with one. The `B = 1` entry reuses the
+  captured piece graphs of the `B >= 2` entry: graphs are cached per bucket, keyed by piece
+  name, generated code and input shapes/strides/dtypes, and all 25 pieces match.
 
 Decode-only steps use `DecodeModule`. Steps with a prefill use the full graph backend when the
 token count is at most 128, the piecewise backend otherwise. After the replay, KV lengths
 are advanced and `lm_head` is applied to the last token of each sequence outside the graph.
+
+**CUDA graph memory**: all captures (piecewise pieces, full mixed and decode graphs) share one
+memory pool (`torch.cuda.graph_pool_handle()`). Only one forward runs at a time, so
+intermediate buffers of different graphs can live at the same addresses. Piece graphs keep
+only a non-owning reference (`weak_ref` in `piecewise/utils.py`) to their output, so its block
+returns to the pool once the forward that captured it no longer needs it. Buckets are captured
+largest first (piecewise, then full mixed, then decode), so smaller captures fit into blocks
+freed by larger ones.
+
+**Dynamo config is thread-local**: `Scheduler` raises `recompile_limit` in the thread that
+builds it, while `loop()` runs in another thread with the default limit of 8. The code object
+`_forward` already has ~50 entries after init, so any compile inside the loop thread fails
+under `fullgraph=True`. This is why every entry, including `B = 1`, is compiled at init.
 
 ### Scheduler (`scheduler/scheduler.py`)
 
@@ -189,30 +205,31 @@ Notes:
   is within run-to-run variation, so this benchmark does not measure the piecewise path.
 
 **Long prompts, higher concurrency**: 128 requests, prompts of 100-1045 tokens
-(`--prompt-tokens 50 1000`), `token_budget=1024`, 32 concurrent requests. Ours
-(`n_slots=33`) runs out of GPU memory during init while capturing the piecewise buckets:
-10.4 GiB of the 12.9 GiB allocated sit in CUDA graph private pools (see Known gaps).
-vLLM with `max_num_seqs=32`:
+(`--prompt-tokens 50 1000`), `token_budget=1024`, 32 concurrent requests: ours with
+`n_slots=33`, vLLM with `max_num_seqs=32` and `max_num_batched_tokens=1024`:
 
-| rate | tok/s | ttft_mean | tpot_mean | e2e_mean | exact% | prefix% |
+| rate | tok/s (ours / vLLM) | ttft_mean | tpot_mean | e2e_mean | exact% | prefix% |
 |---|---|---|---|---|---|---|
-| 2 | 152.8 | 42.9 | 7.38 | 682 | 87.5 | 93.5 |
-| 4 | 300.8 | 43.7 | 7.52 | 697 | 88.3 | 93.7 |
-| 8 | 584.2 | 48.6 | 8.44 | 783 | 84.4 | 92.1 |
-| inf | 1832.5 | 2427 | 15.12 | 3674 | 86.7 | 92.1 |
+| 2 | 151.7 / 152.8 | 24.4 / 42.9 | 6.26 / 7.38 | 560 / 682 | 86.7 / 87.5 | 92.9 / 93.5 |
+| 4 | 301.8 / 300.8 | 29.3 / 43.7 | 6.79 / 7.52 | 620 / 697 | 88.3 / 88.3 | 93.8 / 93.7 |
+| 8 | 590.3 / 584.2 | 26.1 / 48.6 | 6.96 / 8.44 | 629 / 783 | 88.3 / 84.4 | 93.5 / 92.1 |
+| inf | 2117.0 / 1832.5 | 2069 / 2427 | 13.20 / 15.12 | 3154 / 3674 | 88.3 / 86.7 | 92.9 / 92.1 |
 
-vLLM's fp16 outputs diverge from the HF greedy reference in 12-16% of the requests.
+Notes:
+
+- The whole run of ours (init, warmup and the four rates) took 724 s.
+- Both engines match the HF greedy reference exactly in 84-88% of the requests; the rest
+  diverge at some point because of fp16 numerics in batched execution.
+- The vLLM numbers come from a run a few hours earlier with the same settings.
+- Before the shared memory pool, ours ran out of GPU memory during init with this
+  configuration: 10.4 GiB of the 12.9 GiB allocated were in per-graph private pools.
 
 ## Known gaps
 
-- Every CUDA graph allocates its own private memory pool, and every piecewise `Graph` keeps
-  its output alive. Memory grows with the number of graphs (about 13 per piecewise bucket), so
-  `token_budget=1024` with 32 slots does not fit in 8 GiB. vLLM shares one pool across all
-  captures, captures the largest sizes first and keeps only weak references to intermediate
-  outputs.
 - Init is slow: every bucket is a separate Dynamo trace and inductor compile, plus captures.
-- The accuracy of our engine on the long-prompt workload is not measured yet (it does not get
-  past init).
+  `torch.cuda.graph` also runs `gc.collect()` and `empty_cache()` on every capture.
+- `FullMixedModule.static_hidden` and `DecodeModule.static_logits` are still strong
+  references, so their blocks stay reserved in the shared pool.
 - The `ARCHITECTURE` title in `benchmark/report.py` still describes the old slot-KV
   design, so result files carry the wrong title.
 - Concurrency is capped by the largest bucket (32).

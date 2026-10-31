@@ -155,16 +155,20 @@ class Scheduler:
             + 2 * len(piecewise_token_counts)
         )
 
+        self.graph_pool = torch.cuda.graph_pool_handle()
+
+        self.piecewise_backend = PiecewiseGraphBackend(
+            model=self.model,
+            kv_cache=self.kv_cache,
+            token_counts=piecewise_token_counts,
+            pool=self.graph_pool
+        )
         self.full_backend = FullGraphBackend(
             model=self.model,
             kv_cache=self.kv_cache,
             batch_sizes=batch_sizes,
-            token_counts=full_token_counts
-        )
-        self.piecewise_backend = PiecewiseGraphBackend(
-            model=self.model,
-            kv_cache=self.kv_cache,
-            token_counts=piecewise_token_counts
+            token_counts=full_token_counts,
+            pool=self.graph_pool
         )
 
     def _required_pages(

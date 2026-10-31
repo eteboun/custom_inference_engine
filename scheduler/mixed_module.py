@@ -168,6 +168,7 @@ class FullMixedModule(MixedModule):
             kv_cache: KVStorage,
             batch_size: int,
             token_count: int,
+            pool,
             warmup_iters: int = 3
     ) -> None:
         super().__init__(model, kv_cache, token_count)
@@ -190,7 +191,7 @@ class FullMixedModule(MixedModule):
             torch.cuda.current_stream().wait_stream(side_stream)
 
             self.graph = torch.cuda.CUDAGraph()
-            with torch.cuda.graph(self.graph):
+            with torch.cuda.graph(self.graph, pool=pool):
                 self.static_hidden = forward()
 
         self.warmup(min(batch_size, kv_cache.n_slots - 1, token_count))
@@ -216,18 +217,20 @@ class PiecewiseMixedModule(MixedModule):
             model,
             kv_cache: KVStorage,
             token_count: int,
-            buffer: torch.Tensor
+            buffer: torch.Tensor,
+            pool
     ) -> None:
         super().__init__(model, kv_cache, token_count)
 
         self.compiled = torch.compile(
             self._forward,
-            backend=get_piecewise_backend(buffer[:, :token_count]),
+            backend=get_piecewise_backend(buffer[:, :token_count], pool),
             fullgraph=True,
             dynamic=False
         )
 
         self.warmup(min(kv_cache.n_slots - 1, token_count))
+        self.warmup(1)
 
     def _pad(self, slot_ids: list[int]) -> list[int]:
         return slot_ids
