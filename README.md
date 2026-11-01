@@ -227,7 +227,9 @@ Notes:
 ## Known gaps
 
 - Init is slow: every bucket is a separate Dynamo trace and inductor compile, plus captures.
-  `torch.cuda.graph` also runs `gc.collect()` and `empty_cache()` on every capture.
+  `torch.cuda.graph` also runs `torch.cuda.synchronize()` and `empty_cache()` on every capture
+  (`gc.collect()` only if `torch.compiler.config.force_cudagraph_gc` is set, off by default);
+  their share of init time is not measured.
 - `FullMixedModule.static_hidden` and `DecodeModule.static_logits` are still strong
   references, so their blocks stay reserved in the shared pool.
 - The `ARCHITECTURE` title in `benchmark/report.py` still describes the old slot-KV
