@@ -228,7 +228,7 @@ Notes:
 (1-32) and token count (16-512, `T >= B`), `FullMixedModule` and `PiecewiseMixedModule`
 replay the same inputs: `B` sequences sharing `T` tokens, each with 256 tokens already in
 KV. Only `replay()` is timed (median of 7 x 50 iterations); each token count runs in its own
-process. Piecewise overhead over full graph, median over the batch buckets:
+process. Ranges are min-max over the batch buckets; rows marked (median) give the median overhead:
 
 | T | full (ms) | piecewise (ms) | piecewise overhead |
 |---|---|---|---|
