@@ -243,31 +243,11 @@ process. Ranges are min-max over the batch buckets; rows marked (median) give th
   the step is bound by host-side submission (24 eager attention groups, buffer copies,
   Python), and the GPU waits for it.
 - Full graph time jumps by about 1 ms between 128 and 132 tokens and is flat from 132 to
-  148 (see the profile below). Past 128 its GPU time exceeds the piecewise floor, the host
-  work is hidden behind GPU work, and the overhead drops to 4-5%.
+  148. Past 128 its GPU time exceeds the piecewise floor, the host work is hidden behind
+  GPU work, and the overhead drops to 4-5%.
 - The batch size has little effect on the overhead above 128 tokens.
 - This is why steps of up to 128 tokens use the full graph and larger ones the piecewise
   backend. Raw numbers are in `results/threshold/`.
-
-**Where the 128 -> 132 jump comes from**: full graph replays at `T=128` and `T=132` profiled
-with `torch.profiler` (kernel time per replay; B=1, B=32 is within a few percent):
-
-| GEMM (role inferred from call count) | T=128 kernel | time | T=132 kernel | time |
-|---|---|---|---|---|
-| gate + up (48 calls) | `ampere_fp16_s1688gemm 128x128` | 2530 us | `cutlass s16816gemm_relu 128x64` | 2887 us |
-| down (24 calls) | `ampere s16816gemm 128x128` + split-K reduce | 1186 us | `ampere s1688gemm 256x64` | 1480 us |
-| QKV (24 calls) | `cutlass wmma 32x32` | 331 us | `ampere s16816gemm 128x64` | 387 us |
-| o_proj (24 calls) | `ampere s16816gemm 64x64` | 246 us | `ampere s16816gemm 128x64` | 385 us |
-| total | | 4293 us | | 5139 us |
-
-Total kernel time per replay goes from 5.22 to 6.13 ms (B=1) and from 5.61 to 6.42 ms
-(B=32); the GEMMs account for about 0.85 ms of it. The attention kernel changes by less
-than 40 us, and inductor's Triton kernels are renamed (some now contain `mm`, probably
-alignment padding for 132 rows, not verified) with a net effect of a few tens of us. At 128
-tokens the token dimension fits cuBLAS's 128-wide tiles exactly; at 132 cuBLAS switches
-every GEMM to a different kernel that either splits the token dimension over two tiles
-(128x64) or uses one 256-row tile (256x64), so roughly half of the computed rows are
-padding. Why cuBLAS picks these particular kernels is its own heuristic.
 
 ## Known gaps
 
