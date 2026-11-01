@@ -25,8 +25,9 @@ model, and a serving benchmark with Poisson arrivals compares the two.
 | `scheduler/mixed_module.py` | Varlen (prefill + decode) forward: `FullMixedModule` (whole-forward CUDA graph) and `PiecewiseMixedModule` (piecewise CUDA graphs) |
 | `scheduler/graph_backend.py` | `FullGraphBackend` (batch size x token count grid) and `PiecewiseGraphBackend` (token count buckets) |
 | `benchmark/` | Poisson-arrival serving benchmark (`python -m benchmark`) with an HF greedy accuracy check |
+| `feature_bench/` | Benchmarks of individual features, separate from the vLLM comparison; results in `feature_bench/results/` as JSON and HTML |
 | `vllm_baseline/` | vLLM engine for the same model and benchmark |
-| `results/` | Benchmark outputs (timestamped JSON) |
+| `results/` | vLLM comparison outputs (timestamped JSON); runs older than the ones in this README are in `results/obsolete/` |
 | `main.py`, `common.py` | Single-prompt measurement helpers (currently only run vLLM) |
 
 ## Architecture
@@ -135,11 +136,12 @@ the Futures of all running, queued and preempted requests are failed with it.
 GPU runs are done under WSL:
 
 ```bash
-python -m benchmark --impl ours --n-slots 17
-python -m benchmark --impl vllm --max-num-seqs 16
+python -m benchmark --impl ours --n-slots 17 --title "<architecture of this run>"
+python -m benchmark --impl vllm --max-num-seqs 16 --title "vLLM baseline, max_num_seqs=16"
 ```
 
-Main arguments: `--rates` (default `2 4 8 inf` requests/s), `--n-requests` (64),
+`--title` is required and is stored in the result file; it should state the architecture of
+the run. Main arguments: `--rates` (default `2 4 8 inf` requests/s), `--n-requests` (64),
 `--max-new-tokens` (128), `--n-slots` (5), `--page-size` (16), `--token-budget` (256),
 `--max-num-seqs` (vLLM only), `--prompt-tokens MIN MAX` (prepends a context text of a random
 length in that range to each question). vLLM gets `max_num_batched_tokens = token_budget`.
@@ -154,6 +156,21 @@ so at most 32 requests run at once. `token_budget` must be above 128 and a multi
 (requests identical to the reference) and `prefix%` (mean length of the common prefix
 relative to the longer output); trailing EOS tokens are ignored.
 
+### Feature benchmarks (`feature_bench/`)
+
+Each benchmark writes a JSON report; `html_report` turns reports into HTML tables:
+
+```bash
+python -m feature_bench.piecewise_vs_full --title "<what this run tests>"
+python -m feature_bench.step_time --title "<what this run tests>" --token-counts 64 128 256
+python -m feature_bench.html_report feature_bench/results/<report>.json
+```
+
+- `piecewise_vs_full`: runs the same inputs through full graph and piecewise mixed modules and
+  compares the logits.
+- `step_time`: times `replay()` of both modules for each batch size and token count, with one
+  process per token count to keep memory use low.
+
 ## Results
 
 > These are not strict or carefully designed benchmarks. They are temporary measurements
@@ -167,7 +184,8 @@ relative to the longer output); trailing EOS tokens are ignored.
 is all requests arriving at once.
 
 **Against vLLM at the same concurrency (16 requests)**: ours with `n_slots=17` and
-`token_budget=256` (current version), vLLM with `max_num_seqs=16`:
+`token_budget=256` (measured before the shared memory pool, not re-run with the current code),
+vLLM with `max_num_seqs=16`:
 
 | rate | tok/s (ours / vLLM) | ttft_mean | tpot_mean | e2e_mean |
 |---|---|---|---|---|
@@ -199,7 +217,7 @@ Notes:
   occur here.
 - Most of the slowdown that came with chunked prefill was host-side: free pages and slots
   were rebuilt from every slot on each access. Keeping them as incrementally updated sets
-  recovered it and put the current version ahead of the one without chunked prefill.
+  recovered it and put that version ahead of the one without chunked prefill.
 - With these short prompts a step rarely exceeds 128 tokens: at `inf` rate the piecewise
   backend ran 5 of 404 steps (1 of 1500 at rate 8). The difference between the last two rows
   is within run-to-run variation, so this benchmark does not measure the piecewise path.
@@ -247,20 +265,22 @@ process. Ranges are min-max over the batch buckets; rows marked (median) give th
   GPU work, and the overhead drops to 4-5%.
 - The batch size has little effect on the overhead above 128 tokens.
 - This is why steps of up to 128 tokens use the full graph and larger ones the piecewise
-  backend. Raw numbers are in `results/threshold/`.
+  backend. Raw numbers and tables are in `feature_bench/results/`.
 
 ## Known gaps
 
 - The token threshold was measured with a fixed KV context of 256 tokens and timing only
   the replay; the 0.1-0.3 ms that remains above 128 tokens is not broken down.
-
+- `PIECEWISE_TOKEN_STEP = 32` is not based on a measurement.
+- Any compile inside the scheduler thread fails with `FailOnRecompileLimitHit`, so an
+  unexpected guard failure during serving stops the loop.
+- On the long-prompt workload, neither the share of steps going to the piecewise backend nor
+  the total memory use is measured.
 - Init is slow: every bucket is a separate Dynamo trace and inductor compile, plus captures.
   `torch.cuda.graph` also runs `torch.cuda.synchronize()` and `empty_cache()` on every capture
   (`gc.collect()` only if `torch.compiler.config.force_cudagraph_gc` is set, off by default);
   their share of init time is not measured.
 - `FullMixedModule.static_hidden` and `DecodeModule.static_logits` are still strong
   references, so their blocks stay reserved in the shared pool.
-- The `ARCHITECTURE` title in `benchmark/report.py` still describes the old slot-KV
-  design, so result files carry the wrong title.
 - Concurrency is capped by the largest bucket (32).
 - Greedy sampling only; no prefix caching.

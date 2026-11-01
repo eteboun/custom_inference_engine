@@ -6,8 +6,6 @@ from pathlib import Path
 import torch
 
 
-ARCHITECTURE = "slot-kv: contiguous per-slot KV cache, Triton split-KV decode + varlen prefill, CUDA graph decode buckets"
-
 RESULTS_DIR = Path(__file__).resolve().parent.parent / "results"
 
 

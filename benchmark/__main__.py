@@ -7,7 +7,7 @@ from transformers import AutoTokenizer, AutoModelForCausalLM
 from common import MODEL_ID
 from benchmark.metrics import compute_accuracy, compute_metrics, table_header, table_row
 from benchmark.reference import load_reference
-from benchmark.report import ARCHITECTURE, save_results
+from benchmark.report import save_results
 from benchmark.scheduler_client import serve_scheduler
 from benchmark.workload import build_prompts, load_eos_token_ids, poisson_arrivals
 
@@ -25,7 +25,7 @@ def parse_args():
     parser.add_argument("--prompt-tokens", type=int, nargs=2, default=None)
     parser.add_argument("--warmup-requests", type=int, default=8)
     parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument("--title", default=None)
+    parser.add_argument("--title", required=True)
     return parser.parse_args()
 
 
@@ -79,9 +79,8 @@ if __name__ == "__main__":
     warmup = prompts[:args.warmup_requests]
     serve(warmup, [0.0] * len(warmup), "warmup")
 
-    title = args.title or (ARCHITECTURE if args.impl == "ours" else "vLLM baseline")
     lines = [
-        title,
+        args.title,
         f"impl={args.impl}  n_requests={args.n_requests}  max_new_tokens={args.max_new_tokens}  "
         f"n_slots={args.n_slots}  max_num_seqs={args.max_num_seqs}  token_budget={args.token_budget}  "
         f"prompt_tokens={args.prompt_tokens}  seed={args.seed}  (ms)",
@@ -101,5 +100,5 @@ if __name__ == "__main__":
 
     close()
 
-    path = save_results(title, args.impl, vars(args), "\n".join(lines), runs)
+    path = save_results(args.title, args.impl, vars(args), "\n".join(lines), runs)
     print(f"saved: {path}")
