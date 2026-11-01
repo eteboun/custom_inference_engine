@@ -66,7 +66,7 @@ Every forward replays CUDA graphs captured at init. Two backends hold them:
 - **`FullGraphBackend`**: for each batch-size bucket (`DECODE_BATCH_BUCKETS = 1, 2, 4, 8, 16, 32`)
   - a `DecodeModule` (one token per sequence),
   - and a `FullMixedModule` for each token-count bucket up to `FULL_GRAPH_TOKEN_THRESHOLD = 128`
-    (16, 32, 64, 128).
+    (16, 32, 64, 128). The threshold comes from the step-time measurement in Results.
 
   The whole forward, attention included, is one CUDA graph. The batch is padded to the bucket
   size, so `slot_ids` and `cu_seqlens` have fixed shapes.
@@ -224,7 +224,35 @@ Notes:
 - Before the shared memory pool, ours ran out of GPU memory during init with this
   configuration: 10.4 GiB of the 12.9 GiB allocated were in per-graph private pools.
 
+**Full graph vs piecewise step time** (for the token threshold): for each batch bucket
+(1-32) and token count (16-512, `T >= B`), `FullMixedModule` and `PiecewiseMixedModule`
+replay the same inputs: `B` sequences sharing `T` tokens, each with 256 tokens already in
+KV. Only `replay()` is timed (median of 7 x 50 iterations); each token count runs in its own
+process. Piecewise overhead over full graph, median over the batch buckets:
+
+| T | full (ms) | piecewise (ms) | piecewise overhead |
+|---|---|---|---|
+| 16-64 | 3.8-4.5 | 5.9-6.9 | 47-77% |
+| 128 | 5.3-5.7 | 6.3-6.7 | 13-28% |
+| 132-156 | 6.3-7.1 | 6.5-7.6 | ~4-5% (median) |
+| 160 | 6.7-7.4 | 6.9-7.5 | ~3% (median) |
+| 192 | 6.9-7.2 | 7.2-7.5 | 3-4% |
+| 256-512 | 9.0-14.1 | 9.0-14.1 | mostly < 2% |
+
+- Piecewise has a floor of about 6.5 ms up to 128 tokens, independent of the token count:
+  the step is bound by host-side submission (24 eager attention groups, buffer copies,
+  Python), and the GPU waits for it.
+- Full graph time jumps by about 1 ms between 128 and 132 tokens and is flat from 132 to
+  148, which looks like a GEMM tile step (not profiled). Past 128 its GPU time exceeds the
+  piecewise floor, the host work is hidden behind GPU work, and the overhead drops to 4-5%.
+- The batch size has little effect on the overhead above 128 tokens.
+- This is why steps of up to 128 tokens use the full graph and larger ones the piecewise
+  backend. Raw numbers are in `results/threshold/`.
+
 ## Known gaps
+
+- The token threshold was measured with a fixed KV context of 256 tokens and timing only
+  the replay; the 0.1-0.3 ms that remains above 128 tokens is not broken down.
 
 - Init is slow: every bucket is a separate Dynamo trace and inductor compile, plus captures.
   `torch.cuda.graph` also runs `torch.cuda.synchronize()` and `empty_cache()` on every capture
