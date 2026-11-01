@@ -1,90 +1,185 @@
-import math
-import statistics
+import dataclasses
+from collections import Counter
+
+import numpy as np
+
+EngineResult = tuple[list[int], float, float, float]
+TimedResult = tuple[EngineResult, float]
+
+FIRST_DIFF_BIN = 16
 
 
-METRIC_COLUMNS = [
-    ("ttft", "mean"), ("ttft", "p50"), ("ttft", "p99"),
-    ("tpot", "mean"), ("tpot", "p50"), ("tpot", "p99"),
-    ("e2e", "mean"), ("e2e", "p99"),
-]
+@dataclasses.dataclass
+class RequestMetrics:
+    ttft_engine: float
+    ttft_overall: float
+    tpot: float | None
+    e2e: float
+    send_lag: float
 
 
-def percentile(samples, q):
-    if not samples:
-        return float("nan")
-    ordered = sorted(samples)
-    k = (len(ordered) - 1) * q / 100
-    lo, hi = math.floor(k), math.ceil(k)
-    return ordered[lo] + (ordered[hi] - ordered[lo]) * (k - lo)
+@dataclasses.dataclass
+class TokenMatch:
+    exact: bool
+    first_diff: int
+    match_ratio: float
 
 
-def describe(samples):
-    return {
-        "mean": statistics.mean(samples) if samples else float("nan"),
-        "p50": percentile(samples, 50),
-        "p99": percentile(samples, 99),
-    }
+@dataclasses.dataclass
+class ReferenceMatch:
+    n_exact: int
+    mean_match_ratio: float
+    first_diff_histogram: dict[int, int]
 
 
-def compute_metrics(records):
-    start = min(r["planned"] for r in records)
-    end = max(r["t_end"] for r in records)
+@dataclasses.dataclass
+class OverallMetrics:
+    duration: float
+    req_per_s: float
+    tok_per_s: float
+    means: RequestMetrics
+    p50: RequestMetrics
+    p99: RequestMetrics
+    reference_match: ReferenceMatch
+
+
+def get_metrics(
+        result: EngineResult,
+        planned: float
+) -> RequestMetrics:
+    new_tokens, t_arrival, t_first, t_end = result
+
+    ttft_engine = t_first - t_arrival
+    ttft_overall = t_first - planned
+    tpot = (
+        (t_end - t_first) / (l - 1)
+        if (l := len(new_tokens)) != 1
+        else None
+    )
+    e2e = t_end - planned
+    send_lag = t_arrival - planned
+
+    return RequestMetrics(
+        ttft_engine=ttft_engine,
+        ttft_overall=ttft_overall,
+        tpot=tpot,
+        e2e=e2e,
+        send_lag=send_lag
+    )
+
+
+def aggregate_metrics(
+        metrics: list[RequestMetrics],
+        stat
+) -> RequestMetrics:
+    aggregated = {}
+    for field in dataclasses.fields(RequestMetrics):
+        values = [
+            value
+            for m in metrics
+            if (value := getattr(m, field.name)) is not None
+        ]
+        aggregated[field.name] = float(stat(values)) if values else None
+
+    return RequestMetrics(**aggregated)
+
+
+def means_metrics(
+        metrics: list[RequestMetrics]
+) -> RequestMetrics:
+    return aggregate_metrics(metrics, np.mean)
+
+
+def percentile_metrics(
+        metrics: list[RequestMetrics],
+        q: float
+) -> RequestMetrics:
+    return aggregate_metrics(metrics, lambda values: np.percentile(values, q))
+
+
+def strip_eos(tokens: list[int], eos_token_ids: set[int]) -> list[int]:
+    end = len(tokens)
+    while end > 0 and tokens[end - 1] in eos_token_ids:
+        end -= 1
+    return tokens[:end]
+
+
+def compare_tokens(
+        tokens: list[int],
+        reference: list[int],
+        eos_token_ids: set[int]
+) -> TokenMatch:
+    tokens = strip_eos(tokens, eos_token_ids)
+    reference = strip_eos(reference, eos_token_ids)
+
+    first_diff = 0
+    while (
+            first_diff < min(len(tokens), len(reference))
+            and tokens[first_diff] == reference[first_diff]
+    ):
+        first_diff += 1
+
+    return TokenMatch(
+        exact=tokens == reference,
+        first_diff=first_diff,
+        match_ratio=first_diff / longest if (longest := max(len(tokens), len(reference))) else 1.0
+    )
+
+
+def summarize_matches(matches: list[TokenMatch]) -> ReferenceMatch:
+    histogram = Counter(
+        match.first_diff // FIRST_DIFF_BIN * FIRST_DIFF_BIN
+        for match in matches
+        if not match.exact
+    )
+
+    return ReferenceMatch(
+        n_exact=sum(match.exact for match in matches),
+        mean_match_ratio=float(np.mean([match.match_ratio for match in matches])),
+        first_diff_histogram=dict(sorted(histogram.items()))
+    )
+
+
+def summarize(
+        output: list[TimedResult],
+        references: list[list[int]],
+        eos_token_ids: set[int]
+) -> OverallMetrics:
+    n = len(output)
+
+    metrics = []
+    start = float("inf")
+    end = float("-inf")
+    total_tokens = 0
+
+    for result, planned in output:
+        metrics.append(
+            get_metrics(
+                result=result,
+                planned=planned
+            )
+        )
+
+        start = min(start, planned)
+
+        new_tokens, _, _, t_end = result
+        end = max(end, t_end)
+
+        total_tokens += len(new_tokens)
+
     duration = end - start
-    total_tokens = sum(len(r["tokens"]) for r in records)
+    req_per_s = n / duration
+    tok_per_s = total_tokens / duration
 
-    ttft = [r["t_first"] - r["planned"] for r in records]
-    e2e = [r["t_end"] - r["planned"] for r in records]
-    tpot = [
-        (r["t_end"] - r["t_first"]) / (len(r["tokens"]) - 1)
-        for r in records if len(r["tokens"]) > 1
-    ]
-
-    return {
-        "n_requests": len(records),
-        "duration": duration,
-        "req_per_s": len(records) / duration,
-        "tok_per_s": total_tokens / duration,
-        "mean_new_tokens": total_tokens / len(records),
-        "ttft": describe(ttft),
-        "tpot": describe(tpot),
-        "e2e": describe(e2e),
-    }
-
-
-def _strip_eos(tokens, eos_token_ids):
-    while tokens and tokens[-1] in eos_token_ids:
-        tokens = tokens[:-1]
-    return tokens
-
-
-def compute_accuracy(records, refs, eos_token_ids):
-    exact = 0
-    prefix_ratios = []
-    for r, ref in zip(records, refs):
-        ours = _strip_eos(r["tokens"], eos_token_ids)
-        ref = _strip_eos(ref, eos_token_ids)
-        exact += ours == ref
-
-        n = 0
-        while n < min(len(ours), len(ref)) and ours[n] == ref[n]:
-            n += 1
-        prefix_ratios.append(n / max(len(ours), len(ref), 1))
-
-    return {
-        "exact_match": exact / len(records),
-        "prefix_match": statistics.mean(prefix_ratios),
-    }
-
-
-def table_header():
-    cols = "".join(f"{m + '_' + s:>11}" for m, s in METRIC_COLUMNS)
-    return f"{'rate':>6}{'req/s':>8}{'tok/s':>9}{'new_tok':>9}{cols}{'exact%':>8}{'prefix%':>9}"
-
-
-def table_row(rate, m, acc):
-    cols = "".join(f"{m[metric][stat] * 1000:>11.2f}" for metric, stat in METRIC_COLUMNS)
-    return (
-        f"{rate:>6g}{m['req_per_s']:>8.2f}{m['tok_per_s']:>9.1f}"
-        f"{m['mean_new_tokens']:>9.1f}{cols}"
-        f"{acc['exact_match'] * 100:>8.1f}{acc['prefix_match'] * 100:>9.1f}"
+    return OverallMetrics(
+        duration=duration,
+        req_per_s=req_per_s,
+        tok_per_s=tok_per_s,
+        means=means_metrics(metrics),
+        p50=percentile_metrics(metrics, 50),
+        p99=percentile_metrics(metrics, 99),
+        reference_match=summarize_matches([
+            compare_tokens(result[0], reference, eos_token_ids)
+            for (result, _), reference in zip(output, references)
+        ])
     )

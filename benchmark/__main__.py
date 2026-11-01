@@ -1,104 +1,115 @@
 import argparse
-import threading
 
-import torch
-from transformers import AutoTokenizer, AutoModelForCausalLM
+from transformers import AutoTokenizer, GenerationConfig
 
+from benchmark.metrics import summarize
+from benchmark.reference import load_references
+from benchmark.report import save_report
+from benchmark.serve import OursServer, Server, VllmServer
+from benchmark.workload import WorkloadInfo, build_workload, poisson_arrivals
 from common import MODEL_ID
-from benchmark.metrics import compute_accuracy, compute_metrics, table_header, table_row
-from benchmark.reference import load_reference
-from benchmark.report import save_results
-from benchmark.scheduler_client import serve_scheduler
-from benchmark.workload import build_prompts, load_eos_token_ids, poisson_arrivals
 
 
-def parse_args():
+def load_eos_token_ids(tokenizer) -> set[int]:
+    eos = GenerationConfig.from_pretrained(MODEL_ID).eos_token_id
+    if eos is None:
+        eos = tokenizer.eos_token_id
+    if isinstance(eos, int):
+        eos = [eos]
+    return set(eos)
+
+
+def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--impl", choices=["ours", "vllm"], required=True)
-    parser.add_argument("--rates", type=float, nargs="+", default=[2, 4, 8, float("inf")])
-    parser.add_argument("--n-requests", type=int, default=64)
-    parser.add_argument("--max-new-tokens", type=int, default=128)
-    parser.add_argument("--n-slots", type=int, default=5)
-    parser.add_argument("--page-size", type=int, default=16)
-    parser.add_argument("--token-budget", type=int, default=256)
-    parser.add_argument("--max-num-seqs", type=int, default=None)
-    parser.add_argument("--prompt-tokens", type=int, nargs=2, default=None)
-    parser.add_argument("--warmup-requests", type=int, default=8)
-    parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--title", required=True)
-    return parser.parse_args()
-
-
-def make_ours_server(args, eos_token_ids):
-    from scheduler.scheduler import Scheduler
-
-    model = AutoModelForCausalLM.from_pretrained(
-        MODEL_ID, dtype=torch.float16
-    ).to("cuda").eval()
-    sched = Scheduler(model, eos_token_ids, args.max_new_tokens, args.n_slots, args.page_size,
-                      args.token_budget, torch.float16)
-    thread = threading.Thread(target=sched.loop, daemon=True)
-    thread.start()
-
-    def serve(prompts, arrivals, tag):
-        return serve_scheduler(sched, prompts, arrivals)
-
-    def close():
-        sched.stop()
-        thread.join()
-
-    return serve, close
-
-
-def make_vllm_server(args, eos_token_ids):
-    from vllm_baseline.vllm_generate import build_vllm_engine
-    from vllm_baseline.vllm_serve import serve_vllm
-
-    overrides = {"max_num_batched_tokens": args.token_budget}
-    if args.max_num_seqs is not None:
-        overrides["max_num_seqs"] = args.max_num_seqs
-    engine = build_vllm_engine(**overrides)
-
-    def serve(prompts, arrivals, tag):
-        return serve_vllm(engine, prompts, arrivals, eos_token_ids, args.max_new_tokens, tag)
-
-    return serve, lambda: None
-
-
-if __name__ == "__main__":
-    args = parse_args()
+    parser.add_argument("--engine", choices=["ours", "vllm"], required=True)
+    parser.add_argument("--kinds", nargs="+", choices=["short", "long", "mixed"], default=["short", "long", "mixed"])
+    parser.add_argument("--rates", type=float, nargs="+", default=[4.0, 8.0, float("inf")])
+    parser.add_argument("--repeats", type=int, default=3)
+    parser.add_argument("--n-requests", type=int, default=500)
+    parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--max-new-tokens", type=int, default=128)
+    parser.add_argument("--n-slots", type=int, default=33)
+    parser.add_argument("--page-size", type=int, default=16)
+    parser.add_argument("--token-budget", type=int, default=1024)
+    args = parser.parse_args()
 
     tokenizer = AutoTokenizer.from_pretrained(MODEL_ID)
     eos_token_ids = load_eos_token_ids(tokenizer)
-    prompts = build_prompts(tokenizer, args.n_requests, args.seed, args.prompt_tokens)
-    refs = load_reference(prompts, eos_token_ids, args.max_new_tokens)
 
-    make_server = make_ours_server if args.impl == "ours" else make_vllm_server
-    serve, close = make_server(args, eos_token_ids)
+    workloads: dict[str, tuple[list[list[int]], WorkloadInfo, list[list[int]]]] = {}
+    for kind in args.kinds:
+        requests, info = build_workload(
+            tokenizer=tokenizer,
+            kind=kind,
+            n=args.n_requests,
+            seed=args.seed
+        )
+        references = load_references(
+            requests=requests,
+            eos_token_ids=eos_token_ids,
+            max_new_tokens=args.max_new_tokens
+        )
+        workloads[kind] = requests, info, references
 
-    warmup = prompts[:args.warmup_requests]
-    serve(warmup, [0.0] * len(warmup), "warmup")
+    server: Server = (
+        OursServer(args, eos_token_ids)
+        if args.engine == "ours"
+        else VllmServer(args, eos_token_ids)
+    )
 
-    lines = [
-        args.title,
-        f"impl={args.impl}  n_requests={args.n_requests}  max_new_tokens={args.max_new_tokens}  "
-        f"n_slots={args.n_slots}  max_num_seqs={args.max_num_seqs}  token_budget={args.token_budget}  "
-        f"prompt_tokens={args.prompt_tokens}  seed={args.seed}  (ms)",
-        table_header(),
-    ]
-    print("\n".join(lines))
+    settings = {
+        "n_requests": args.n_requests,
+        "max_new_tokens": args.max_new_tokens,
+        "n_slots": args.n_slots,
+        "page_size": args.page_size,
+        "token_budget": args.token_budget,
+        "prompt_seed": args.seed,
+    }
 
-    runs = []
-    for rate in args.rates:
-        arrivals = poisson_arrivals(args.n_requests, rate, args.seed)
-        records = serve(prompts, arrivals, f"rate{rate:g}")
-        metrics = compute_metrics(records)
-        accuracy = compute_accuracy(records, refs, eos_token_ids)
-        lines.append(table_row(rate, metrics, accuracy))
-        print(lines[-1])
-        runs.append({"rate": rate, "metrics": metrics, "accuracy": accuracy, "records": records})
+    for repeat in range(args.repeats):
+        for kind, (requests, info, references) in workloads.items():
+            for rate in args.rates:
+                arrival_seed = args.seed + repeat
 
-    close()
+                serve_result = server.serve(
+                    requests=requests,
+                    arrivals=poisson_arrivals(
+                        n=args.n_requests,
+                        seed=arrival_seed,
+                        rate=rate
+                    )
+                )
 
-    path = save_results(args.title, args.impl, vars(args), "\n".join(lines), runs)
-    print(f"saved: {path}")
+                summary = summarize(
+                    output=serve_result.output,
+                    references=references,
+                    eos_token_ids=eos_token_ids
+                )
+
+                json_path, _ = save_report(
+                    title=args.title,
+                    engine=args.engine,
+                    settings={
+                        **settings,
+                        "rate": rate,
+                        "repeat": repeat,
+                        "arrival_seed": arrival_seed,
+                    },
+                    info=info,
+                    summary=summary,
+                    serve_result=serve_result
+                )
+                print(
+                    f"{kind} rate={rate:g} repeat={repeat} "
+                    f"tok/s={summary.tok_per_s:.1f} "
+                    f"exact={summary.reference_match.n_exact}/{args.n_requests} "
+                    f"saved={json_path.name}",
+                    flush=True
+                )
+
+    server.close()
+
+
+if __name__ == "__main__":
+    main()

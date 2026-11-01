@@ -1,12 +1,13 @@
 import queue
 import time
 import math
-from concurrent.futures import Future
+from concurrent.futures import Future, InvalidStateError
 
 import torch
 from typing import ClassVar
+from transformers import AutoModelForCausalLM
 from attn.core import use_triton_attention
-from scheduler.models import Request
+from scheduler.models import ComponentInitStats, Request, Tracker
 from kv_cache.storage import KVStorage
 from scheduler.graph_backend import FullGraphBackend, PiecewiseGraphBackend
 
@@ -23,7 +24,7 @@ class Scheduler:
 
     def __init__(
             self,
-            model,
+            model_id: str,
             eos_token_ids: set[int],
             max_new_tokens: int,
             n_slots: int,
@@ -31,6 +32,8 @@ class Scheduler:
             token_budget: int,
             dtype: torch.dtype
     ) -> None:
+
+        init_start = time.perf_counter()
 
         if n_slots <= 1:
             raise ValueError(
@@ -67,6 +70,15 @@ class Scheduler:
                 "token_budget must be a multiple of PIECEWISE_TOKEN_STEP."
             )
 
+        self.tracker = Tracker()
+
+        start = time.perf_counter()
+        allocated_before = torch.cuda.memory_allocated()
+        model = AutoModelForCausalLM.from_pretrained(
+            model_id, dtype=dtype
+        ).to("cuda").eval()
+        self.tracker.init.model = self._init_stats(start, allocated_before)
+
         try:
             use_triton_attention(model)
 
@@ -83,6 +95,8 @@ class Scheduler:
         self.token_budget = token_budget
         self.eos_token_ids = frozenset(eos_token_ids)
 
+        start = time.perf_counter()
+        allocated_before = torch.cuda.memory_allocated()
         self.kv_cache = KVStorage(
             config=model.config,
             max_cache_len=self.KV_CACHE_CAPACITY,
@@ -91,6 +105,7 @@ class Scheduler:
             device=model.device,
             dtype=dtype
         )
+        self.tracker.init.kv_cache = self._init_stats(start, allocated_before)
         self.n_pages = self.kv_cache.n_pages
 
         if self._required_pages(1, True) > self.n_pages - 1:
@@ -112,6 +127,8 @@ class Scheduler:
         self.slot_ids = set(range(self.n_slots))
         self._reset_occupancy()
         self.open = True
+
+        self.tracker.init.total_seconds = time.perf_counter() - init_start
 
     def _reset_occupancy(self) -> None:
         self._empty_pages: set[int] = self.page_ids - {self.kv_cache.unused_idx}
@@ -157,18 +174,35 @@ class Scheduler:
 
         self.graph_pool = torch.cuda.graph_pool_handle()
 
+        start = time.perf_counter()
+        allocated_before = torch.cuda.memory_allocated()
         self.piecewise_backend = PiecewiseGraphBackend(
             model=self.model,
             kv_cache=self.kv_cache,
             token_counts=piecewise_token_counts,
             pool=self.graph_pool
         )
+        self.tracker.init.piecewise = self._init_stats(start, allocated_before)
+
+        start = time.perf_counter()
+        allocated_before = torch.cuda.memory_allocated()
         self.full_backend = FullGraphBackend(
             model=self.model,
             kv_cache=self.kv_cache,
             batch_sizes=batch_sizes,
             token_counts=full_token_counts,
             pool=self.graph_pool
+        )
+        self.tracker.init.full = self._init_stats(start, allocated_before)
+
+    @staticmethod
+    def _init_stats(start: float, allocated_before: int) -> ComponentInitStats:
+        allocated = torch.cuda.memory_allocated()
+        return ComponentInitStats(
+            seconds=time.perf_counter() - start,
+            memory=allocated - allocated_before,
+            memory_allocated=allocated,
+            memory_reserved=torch.cuda.memory_reserved()
         )
 
     def _required_pages(
@@ -298,7 +332,8 @@ class Scheduler:
                 t_first = req.t_first or current
                 new_tokens = req.new_tokens + [token]
 
-                req.future.set_result(
+                self._complete(
+                    req.future,
                     (new_tokens, t_arrival, t_first, current)
                 )
 
@@ -319,7 +354,10 @@ class Scheduler:
         reqs = [self.slots[id_] for id_ in slot_ids]
         self._clear(slot_ids)
 
+        self.tracker.run.preemptions += len(reqs)
+
         for req in reqs:
+            self.tracker.run.recomputed_tokens += req.kv_len
             req.prefilled = False
             req.kv_len = 0
             req.pages = set()
@@ -393,6 +431,20 @@ class Scheduler:
 
         return new_slot_ids, new_required_pages, new_budgets
 
+    @staticmethod
+    def _complete(future: Future, result: tuple) -> None:
+        try:
+            future.set_result(result)
+        except InvalidStateError:
+            pass
+
+    @staticmethod
+    def _fail(future: Future, exc: Exception) -> None:
+        try:
+            future.set_exception(exc)
+        except InvalidStateError:
+            pass
+
     def _consume_queue(self, exc: Exception) -> None:
         while True:
             try:
@@ -404,12 +456,12 @@ class Scheduler:
                 self.open = False
                 continue
 
-            req.future.set_exception(exc)
+            self._fail(req.future, exc)
 
     def _consume_preempted(self, exc: Exception) -> None:
         while self.preempted:
             req = self.preempted.pop()
-            req.future.set_exception(exc)
+            self._fail(req.future, exc)
 
     def _clear(self, ids: list[int] | None = None) -> None:
 
@@ -436,45 +488,41 @@ class Scheduler:
 
     def _end(self, exc: Exception) -> None:
         for id_ in self._filled_slots:
-            self.slots[id_].future.set_exception(exc)
+            self._fail(self.slots[id_].future, exc)
 
         self._consume_queue(exc=exc)
         self._consume_preempted(exc=exc)
         self._clear()
 
-    def call(self, batch: list[list[int]]) -> list[Future]:
-        futs = []
+    def call(self, prompt: list[int]) -> Future:
         t_arrival = time.perf_counter()
 
-        for prompt in batch:
-            fut = Future()
+        fut = Future()
 
-            l = len(prompt)
-            if not self.open:
-                fut.set_exception(RuntimeError(
-                    "Loop is not open."
-                ))
+        l = len(prompt)
+        if not self.open:
+            fut.set_exception(RuntimeError(
+                "Loop is not open."
+            ))
 
-            elif l == 0:
-                fut.set_exception(ValueError(
-                    "Empty prompts are not allowed."
-                ))
+        elif l == 0:
+            fut.set_exception(ValueError(
+                "Empty prompts are not allowed."
+            ))
 
-            elif self._required_pages(l, total=True) > self.n_pages - 1:
-                fut.set_exception(ValueError(
-                    "Possible amount of tokens exceeds available pages."
-                ))
+        elif self._required_pages(l, total=True) > self.n_pages - 1:
+            fut.set_exception(ValueError(
+                "Possible amount of tokens exceeds available pages."
+            ))
 
-            else:
-                self.requests.put(Request(
-                    prompt=prompt,
-                    future=fut,
-                    t_arrival=t_arrival
-                ))
+        else:
+            self.requests.put(Request(
+                prompt=prompt,
+                future=fut,
+                t_arrival=t_arrival
+            ))
 
-            futs.append(fut)
-
-        return futs
+        return fut
 
     def stop(self) -> None:
         self.requests.put(self.SENTINEL)
@@ -618,10 +666,17 @@ class Scheduler:
 
             input_slots.append(id_)
 
+        if not input_slots:
+            return
+
+        run_stats = self.tracker.run
+        run_stats.batch_sizes[len(input_slots)] += 1
+
         if kernel == "decode":
             decode_module = self.full_backend.get_decode_module(
                 len(input_slots)
             )
+            run_stats.decode_steps[decode_module.batch_size] += 1
             new_tokens = decode_module.forward(
                 slot_ids=input_slots
             )
@@ -641,10 +696,17 @@ class Scheduler:
                 mixed_module = self.full_backend.get_mixed_module(
                     len(input_slots), token_count
                 )
+                run_stats.full_mixed_steps[
+                    (mixed_module.batch_size, mixed_module.token_count)
+                ] += 1
             else:
                 mixed_module = self.piecewise_backend.get_mixed_module(
                     token_count
                 )
+                run_stats.piecewise_mixed_steps[mixed_module.token_count] += 1
+
+            run_stats.tokens += token_count
+            run_stats.bucket_tokens += mixed_module.token_count
 
             new_tokens = mixed_module.forward(
                 prompts=prompts,

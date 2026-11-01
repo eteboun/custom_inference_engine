@@ -1,9 +1,9 @@
-import random
+import dataclasses
 
-from transformers import GenerationConfig
+import numpy as np
 
-from common import MODEL_ID
-
+SHORT_TOKENS = (30, 50)
+LONG_TOKENS = (500, 1000)
 
 QUESTIONS = [
     "What is a GPU warp?",
@@ -85,47 +85,102 @@ CONTEXT_PARAGRAPHS = [
 ]
 
 
-def load_eos_token_ids(tokenizer):
-    eos = GenerationConfig.from_pretrained(MODEL_ID).eos_token_id
-    if eos is None:
-        eos = tokenizer.eos_token_id
-    if isinstance(eos, int):
-        eos = [eos]
-    return set(eos)
+@dataclasses.dataclass
+class WorkloadInfo:
+    kind: str
+    n_short: int
+    n_long: int
+    mean_tokens: float
+    seed: int
 
 
-def build_context(tokenizer, rng, n_tokens):
-    paragraphs = CONTEXT_PARAGRAPHS[:]
-    ids = []
-    while len(ids) < n_tokens:
-        rng.shuffle(paragraphs)
-        ids += tokenizer.encode("\n\n".join(paragraphs) + "\n\n", add_special_tokens=False)
-    return tokenizer.decode(ids[:n_tokens])
+def chat_template_parts(tokenizer) -> tuple[list[int], list[int]]:
+    marker = "<<CONTENT>>"
+    text = tokenizer.apply_chat_template(
+        [{"role": "user", "content": marker}],
+        tokenize=False,
+        add_generation_prompt=True,
+    )
+    head, tail = text.split(marker)
+    return (
+        tokenizer.encode(head, add_special_tokens=False),
+        tokenizer.encode(tail, add_special_tokens=False),
+    )
 
 
-def build_prompts(tokenizer, n_requests, seed, prompt_tokens=None):
-    rng = random.Random(seed)
-    prompts = []
-    for _ in range(n_requests):
-        question = rng.choice(QUESTIONS)
-        if prompt_tokens is not None:
-            context = build_context(tokenizer, rng, rng.randint(*prompt_tokens))
-            question = f"Read the following text, then answer the question.\n\n{context}\n\nQuestion: {question}"
-        encoded = tokenizer.apply_chat_template(
-            [{"role": "user", "content": question}],
-            tokenize=True,
-            add_generation_prompt=True,
-            return_dict=True,
+def short_prompt(tokenizer, rng: np.random.Generator) -> list[int]:
+    head, tail = chat_template_parts(tokenizer)
+    while True:
+        question = QUESTIONS[rng.integers(len(QUESTIONS))]
+        prompt = head + tokenizer.encode(question, add_special_tokens=False) + tail
+        if SHORT_TOKENS[0] <= len(prompt) <= SHORT_TOKENS[1]:
+            return prompt
+
+
+def long_prompt(tokenizer, rng: np.random.Generator) -> list[int]:
+    head, tail = chat_template_parts(tokenizer)
+    question = QUESTIONS[rng.integers(len(QUESTIONS))]
+
+    intro = tokenizer.encode(
+        "Read the following text, then answer the question.\n\n",
+        add_special_tokens=False
+    )
+    outro = tokenizer.encode(
+        f"\n\nQuestion: {question}",
+        add_special_tokens=False
+    )
+
+    target = int(rng.integers(LONG_TOKENS[0], LONG_TOKENS[1] + 1))
+    n_context = target - len(head) - len(intro) - len(outro) - len(tail)
+
+    context = []
+    while len(context) < n_context:
+        paragraphs = rng.permutation(CONTEXT_PARAGRAPHS).tolist()
+        context += tokenizer.encode(
+            "\n\n".join(paragraphs) + "\n\n",
+            add_special_tokens=False
         )
-        prompts.append(list(encoded["input_ids"]))
-    return prompts
+
+    return head + intro + context[:n_context] + outro + tail
 
 
-def poisson_arrivals(n_requests, rate, seed):
-    rng = random.Random(seed)
-    t = 0.0
-    arrivals = []
-    for _ in range(n_requests):
-        t += rng.expovariate(rate)
-        arrivals.append(t)
-    return arrivals
+def build_workload(
+        tokenizer,
+        kind: str,
+        n: int,
+        seed: int
+) -> tuple[list[list[int]], WorkloadInfo]:
+
+    n_long = {"short": 0, "long": n, "mixed": n // 2}[kind]
+    n_short = n - n_long
+
+    rng = np.random.default_rng(seed)
+    prompts = [short_prompt(tokenizer, rng) for _ in range(n_short)]
+    prompts += [long_prompt(tokenizer, rng) for _ in range(n_long)]
+    rng.shuffle(prompts)
+
+    info = WorkloadInfo(
+        kind=kind,
+        n_short=n_short,
+        n_long=n_long,
+        mean_tokens=float(np.mean([len(prompt) for prompt in prompts])),
+        seed=seed
+    )
+
+    return prompts, info
+
+
+def poisson_arrivals(
+        n: int,
+        seed: int,
+        rate: float
+) -> list[float]:
+
+    rng = np.random.default_rng(seed)
+    gaps = rng.exponential(
+        1 / rate,
+        size=n
+    )
+    arrivals = np.cumsum(gaps)
+
+    return arrivals.tolist()
