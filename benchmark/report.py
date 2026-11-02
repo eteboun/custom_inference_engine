@@ -62,13 +62,14 @@ def latency_table(summary: OverallMetrics) -> dict:
 
     return {
         "title": "Latency (ms)",
-        "columns": ["metric", "mean", "p50", "p99"],
+        "columns": ["metric", "mean", "p50", "p99", "max"],
         "rows": [
             [
                 field.name,
                 milliseconds(summary.means, field.name),
                 milliseconds(summary.p50, field.name),
                 milliseconds(summary.p99, field.name),
+                milliseconds(summary.max, field.name),
             ]
             for field in dataclasses.fields(RequestMetrics)
         ],
@@ -230,8 +231,8 @@ def comparison_values(report: dict) -> dict[str, str]:
         "requests/s": f"{req_per_s:.2f}",
         "tokens/s": f"{tok_per_s:.1f}",
     }
-    for metric, mean, p50, p99 in table_by_title(report, "Latency (ms)")["rows"]:
-        for stat, value in (("mean", mean), ("p50", p50), ("p99", p99)):
+    for metric, mean, p50, p99, maximum in table_by_title(report, "Latency (ms)")["rows"]:
+        for stat, value in (("mean", mean), ("p50", p50), ("p99", p99), ("max", maximum)):
             values[f"{metric} {stat}"] = "-" if value is None else f"{value:.2f}"
 
     values["exact"] = f"{n_exact}/{n_requests}"

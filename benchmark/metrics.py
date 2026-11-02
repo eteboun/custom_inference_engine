@@ -47,6 +47,7 @@ class OverallMetrics:
     means: RequestMetrics
     p50: RequestMetrics
     p99: RequestMetrics
+    max: RequestMetrics
     reference_match: ReferenceMatch
 
 
@@ -97,6 +98,12 @@ def means_metrics(
         metrics: list[RequestMetrics]
 ) -> RequestMetrics:
     return aggregate_metrics(metrics, np.mean)
+
+
+def max_metrics(
+        metrics: list[RequestMetrics]
+) -> RequestMetrics:
+    return aggregate_metrics(metrics, np.max)
 
 
 def percentile_metrics(
@@ -188,6 +195,7 @@ def summarize(
         means=means_metrics(metrics),
         p50=percentile_metrics(metrics, 50),
         p99=percentile_metrics(metrics, 99),
+        max=max_metrics(metrics),
         reference_match=summarize_matches([
             compare_tokens(timed.result.new_tokens, reference, eos_token_ids)
             for timed, reference in zip(output, references)
