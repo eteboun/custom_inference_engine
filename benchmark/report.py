@@ -40,7 +40,7 @@ def git_state() -> dict[str, str | bool]:
 
     return {
         "commit": git("rev-parse", "--short", "HEAD"),
-        "dirty": bool(git("-c", "core.autocrlf=true", "status", "--porcelain", "--", ".", ":!results")),
+        "dirty": bool(git("-c", "core.autocrlf=true", "status", "--porcelain", "--untracked-files=no")),
     }
 
 
