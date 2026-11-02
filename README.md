@@ -176,7 +176,7 @@ so at most 32 requests run at once. `token_budget` must be above 128 and a multi
 `repetition_penalty=1.0`) and cached in `results/reference/`. Reports give the number of
 requests identical to the reference (`exact`) and the mean share of tokens matching up to the
 first difference (`match ratio`), using every request; trailing EOS tokens are ignored. The
-reference is not ground truth: it is also fp16, so a difference is not necessarily an error.
+reference also runs in fp16.
 
 ### Feature benchmarks (`feature_bench/`)
 
@@ -199,7 +199,8 @@ python -m feature_bench.html_report feature_bench/results/<report>.json
 
 Run `results/20261102-142549`, commit `984f70d`: 500 requests per configuration,
 `max_new_tokens=128`, 32 concurrent requests, `token_budget=1024`. Values are `ours | vLLM`,
-the mean of 3 repeats; times are in ms.
+the mean of 3 repeats; times are in ms. Full results for every configuration are in
+`results/20261102-142549/report.html`, and the per-request records are in its JSON files.
 
 | workload | rate | tok/s | ttft_overall | tpot | e2e mean | e2e p99 | exact (of 500) |
 |---|---|---|---|---|---|---|---|
@@ -217,21 +218,18 @@ the mean of 3 repeats; times are in ms.
   ranges of the 3 repeats do not overlap.
 - At rates 4 and 8, throughput equals the offered load on both engines. Ours has lower tpot
   (about 15-20%) and e2e (about 15-25%).
-- Part of the TTFT difference comes from the client: vLLM's single-threaded loop can only submit
-  between steps, so its `send_lag` p99 is 15-28 ms against about 2 ms for ours. The difference
-  remains in `ttft_engine` (for example 10.2 | 28.1 ms on `short` at rate 4).
+- `send_lag` p99 at rates 4 and 8 is about 2 ms for ours and 13-30 ms for vLLM. TTFT measured
+  from the actual submission (`ttft_engine`) also differs: 10.2 | 28.1 ms on `short` at rate 4.
 - Both engines match the HF reference on about 84-89% of requests, with no consistent winner
   except `short` at `inf`.
-- There were no preemptions. The piecewise backend ran almost all mixed steps on `long`, about
-  half on `mixed`, and few on `short`.
-- Init: ours 462 s with a warm inductor cache, vLLM 44 s. PyTorch reserved 2180 MiB for ours:
-  model 950 MiB, KV cache 385 MiB, graphs and the shared attention buffer 263 MiB.
-- GPU: at most 77 C and 79 W. Under load the median SM clock was 2475 MHz, but some samples
-  dropped to about 1080 MHz with a power-cap flag, and these are not matched to runs yet.
+- There were no preemptions. Step counts per backend are in the report.
+- Init: ours 462 s, vLLM 44 s. PyTorch memory for ours after init: 2180 MiB reserved, of which
+  1654 MiB allocated (model 950 MiB, KV cache 385 MiB, piecewise backend 263 MiB, full graph
+  backend 0.1 MiB).
+- GPU, from `gpu.csv`: at most 77 C and 79 W. These samples are not matched to individual runs.
 
 These numbers come from one laptop GPU under WSL, with ours always running first, and from
-synthetic workloads on a small model. They compare the two engines under these conditions and
-do not predict production behavior or other models.
+synthetic workloads on a small model. They compare the two engines under these conditions only.
 
 ### Earlier measurements (previous benchmark)
 
@@ -274,15 +272,6 @@ vLLM with `max_num_seqs=16`:
 
 Notes:
 
-- Default vLLM is ahead because of concurrency: it decodes all 64 requests at once, while
-  our limit is 16. Decode is memory-bandwidth bound, so step time grows little with batch
-  size and throughput grows almost proportionally.
-- The prompts in this benchmark are shorter than the 256-token budget, so chunking never
-  kicks in. The case chunked prefill helps with (a long prefill blocking decodes) does not
-  occur here.
-- Most of the slowdown that came with chunked prefill was host-side: free pages and slots
-  were rebuilt from every slot on each access. Keeping them as incrementally updated sets
-  recovered it and put that version ahead of the one without chunked prefill.
 - With these short prompts a step rarely exceeds 128 tokens: at `inf` rate the piecewise
   backend ran 5 of 404 steps (1 of 1500 at rate 8). The difference between the last two rows
   is within run-to-run variation, so this benchmark does not measure the piecewise path.
@@ -301,8 +290,7 @@ Notes:
 Notes:
 
 - The whole run of ours (init, warmup and the four rates) took 724 s.
-- Both engines match the HF greedy reference exactly in 84-88% of the requests; the rest
-  diverge at some point because of fp16 numerics in batched execution.
+- Both engines match the HF greedy reference exactly in 84-88% of the requests.
 - The vLLM numbers come from a run a few hours earlier with the same settings.
 - Before the shared memory pool, ours ran out of GPU memory during init with this
   configuration: 10.4 GiB of the 12.9 GiB allocated were in per-graph private pools.
@@ -322,12 +310,9 @@ process. Ranges are min-max over the batch buckets; rows marked (median) give th
 | 192 | 6.9-7.2 | 7.2-7.5 | 3-4% |
 | 256-512 | 9.0-14.1 | 9.0-14.1 | mostly < 2% |
 
-- Piecewise has a floor of about 6.5 ms up to 128 tokens, independent of the token count:
-  the step is bound by host-side submission (24 eager attention groups, buffer copies,
-  Python), and the GPU waits for it.
-- Full graph time jumps by about 1 ms between 128 and 132 tokens and is flat from 132 to
-  148. Past 128 its GPU time exceeds the piecewise floor, the host work is hidden behind
-  GPU work, and the overhead drops to 4-5%.
+- Piecewise stays at about 6.2-6.7 ms up to 128 tokens, regardless of the token count.
+- Full graph time rises by about 1 ms between 128 and 132 tokens and is nearly flat from 132
+  to 148. The overhead is 13-28% at 128 tokens and about 4-5% (median) from 132 to 156.
 - The batch size has little effect on the overhead above 128 tokens.
 - This is why steps of up to 128 tokens use the full graph and larger ones the piecewise
   backend. Raw numbers and tables are in `feature_bench/results/`.
