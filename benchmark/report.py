@@ -40,7 +40,7 @@ def git_state() -> dict[str, str | bool]:
 
     return {
         "commit": git("rev-parse", "--short", "HEAD"),
-        "dirty": bool(git("status", "--porcelain")),
+        "dirty": bool(git("-c", "core.autocrlf=true", "status", "--porcelain", "--", ".", ":!results")),
     }
 
 
@@ -231,9 +231,8 @@ def comparison_values(report: dict) -> dict[str, str]:
         "tokens/s": f"{tok_per_s:.1f}",
     }
     for metric, mean, p50, p99 in table_by_title(report, "Latency (ms)")["rows"]:
-        values[f"{metric} mean"] = f"{mean:.2f}"
-        values[f"{metric} p50"] = f"{p50:.2f}"
-        values[f"{metric} p99"] = f"{p99:.2f}"
+        for stat, value in (("mean", mean), ("p50", p50), ("p99", p99)):
+            values[f"{metric} {stat}"] = "-" if value is None else f"{value:.2f}"
 
     values["exact"] = f"{n_exact}/{n_requests}"
     values["match ratio"] = f"{match_ratio:.3f}"
