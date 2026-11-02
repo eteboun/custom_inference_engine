@@ -1,6 +1,7 @@
 import torch
 
 from attn.metadata import AttentionMetadata
+from piecewise.utils import weak_ref
 from scheduler.slots import pad_slot_ids
 from kv_cache.storage import KVStorage
 
@@ -44,7 +45,9 @@ class DecodeModule:
 
             self.graph = torch.cuda.CUDAGraph()
             with torch.cuda.graph(self.graph, pool=pool):
-                self.static_logits = forward().logits[0]
+                output = forward().logits[0]
+
+            self.static_logits = weak_ref(output)
 
         self.warmup()
 

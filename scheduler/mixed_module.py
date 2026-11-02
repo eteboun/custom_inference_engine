@@ -4,6 +4,7 @@ import torch.nn.functional as F
 from attn.metadata import AttentionMetadata
 from kv_cache.storage import KVStorage
 from piecewise.backend import get_piecewise_backend
+from piecewise.utils import weak_ref
 from scheduler.slots import pad_slot_ids
 
 class MixedModule:
@@ -192,7 +193,9 @@ class FullMixedModule(MixedModule):
 
             self.graph = torch.cuda.CUDAGraph()
             with torch.cuda.graph(self.graph, pool=pool):
-                self.static_hidden = forward()
+                output = forward()
+
+            self.static_hidden = weak_ref(output)
 
         self.warmup(min(batch_size, kv_cache.n_slots - 1, token_count))
 

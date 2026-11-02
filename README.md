@@ -92,9 +92,9 @@ are advanced and `lm_head` is applied to the last token of each sequence outside
 
 **CUDA graph memory**: all captures (piecewise pieces, full mixed and decode graphs) share one
 memory pool (`torch.cuda.graph_pool_handle()`). Only one forward runs at a time, so
-intermediate buffers of different graphs can live at the same addresses. Piece graphs keep
-only a non-owning reference (`weak_ref` in `piecewise/utils.py`) to their output, so its block
-returns to the pool once the forward that captured it no longer needs it. Buckets are captured
+intermediate buffers of different graphs can live at the same addresses. Piece, full mixed
+and decode graphs keep only a non-owning reference (`weak_ref` in `piecewise/utils.py`) to their
+output, so its block returns to the pool once the forward that captured it no longer needs it. Buckets are captured
 largest first (piecewise, then full mixed, then decode), so smaller captures fit into blocks
 freed by larger ones.
 
@@ -280,7 +280,5 @@ process. Ranges are min-max over the batch buckets; rows marked (median) give th
   `torch.cuda.graph` also runs `torch.cuda.synchronize()` and `empty_cache()` on every capture
   (`gc.collect()` only if `torch.compiler.config.force_cudagraph_gc` is set, off by default);
   their share of init time is not measured.
-- `FullMixedModule.static_hidden` and `DecodeModule.static_logits` are still strong
-  references, so their blocks stay reserved in the shared pool.
 - Concurrency is capped by the largest bucket (32).
 - Greedy sampling only; no prefix caching.
