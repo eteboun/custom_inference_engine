@@ -146,6 +146,17 @@ def run_engine(args: argparse.Namespace) -> None:
     server.close()
 
 
+def start_gpu_log(run_dir: Path) -> subprocess.Popen:
+    return subprocess.Popen([
+        "nvidia-smi",
+        "--query-gpu=timestamp,temperature.gpu,power.draw,power.limit,clocks.sm,"
+        "clocks_throttle_reasons.active,memory.used",
+        "--format=csv",
+        "-l", "5",
+        "-f", str(run_dir / "gpu.csv"),
+    ])
+
+
 def main() -> None:
     args = parse_args()
 
@@ -154,15 +165,21 @@ def main() -> None:
         return
 
     run_dir = create_run_dir(args.engines)
-    for engine in args.engines:
-        subprocess.run(
-            [
-                sys.executable, "-m", "benchmark", *sys.argv[1:],
-                "--worker-engine", engine,
-                "--run-dir", str(run_dir),
-            ],
-            check=True,
-        )
+    gpu_log = start_gpu_log(run_dir)
+
+    try:
+        for engine in args.engines:
+            subprocess.run(
+                [
+                    sys.executable, "-m", "benchmark", *sys.argv[1:],
+                    "--worker-engine", engine,
+                    "--run-dir", str(run_dir),
+                ],
+                check=True,
+            )
+    finally:
+        gpu_log.terminate()
+        gpu_log.wait()
 
     print(f"report: {run_dir / 'report.html'}")
 
