@@ -20,14 +20,14 @@ model, and a serving benchmark with Poisson arrivals compares the two.
 | `piecewise/` | Piecewise `torch.compile` backend: splits the graph at attention, captures the other pieces as CUDA graphs |
 | `kv_cache/storage.py` | Paged KV pool, block table, per-slot length and last generated token |
 | `scheduler/scheduler.py` | Thread-based scheduler: queue, token budget, page allocation, preemption |
-| `scheduler/models.py` | Per-request state kept by the scheduler (`Request`) |
+| `scheduler/models.py` | Per-request state and results (`Request`, `RequestResult`), and init and run statistics (`Tracker`) |
 | `scheduler/decode_module.py` | Pure decode forward captured as a CUDA graph |
 | `scheduler/mixed_module.py` | Varlen (prefill + decode) forward: `FullMixedModule` (whole-forward CUDA graph) and `PiecewiseMixedModule` (piecewise CUDA graphs) |
 | `scheduler/graph_backend.py` | `FullGraphBackend` (batch size x token count grid) and `PiecewiseGraphBackend` (token count buckets) |
-| `benchmark/` | Poisson-arrival serving benchmark (`python -m benchmark`) with an HF greedy accuracy check |
+| `benchmark/` | Serving benchmark against vLLM (`python -m benchmark`): workloads, clients, metrics, HF greedy reference, reports |
 | `feature_bench/` | Benchmarks of individual features, separate from the vLLM comparison; results in `feature_bench/results/` as JSON and HTML |
 | `vllm_baseline/` | vLLM engine for the same model and benchmark |
-| `results/` | vLLM comparison outputs (timestamped JSON); runs older than the ones in this README are in `results/obsolete/` |
+| `results/` | One timestamped folder per benchmark run; `results/reference/` caches HF outputs. The loose JSON files and `results/obsolete/` come from the previous benchmark |
 | `main.py`, `common.py` | Single-prompt measurement helpers (currently only run vLLM) |
 
 ## Architecture
@@ -133,28 +133,50 @@ the Futures of all running, queued and preempted requests are failed with it.
 
 ## Running
 
-GPU runs are done under WSL:
+GPU runs are done under WSL. One command runs both engines, each in its own process:
 
 ```bash
-python -m benchmark --impl ours --n-slots 17 --title "<architecture of this run>"
-python -m benchmark --impl vllm --max-num-seqs 16 --title "vLLM baseline, max_num_seqs=16"
+python -m benchmark --title "<architecture of this run>"
+bash benchmark/smoke_test.sh    # short check of the whole path
 ```
 
-`--title` is required and is stored in the result file; it should state the architecture of
-the run. Main arguments: `--rates` (default `2 4 8 inf` requests/s), `--n-requests` (64),
-`--max-new-tokens` (128), `--n-slots` (5), `--page-size` (16), `--token-budget` (256),
-`--max-num-seqs` (vLLM only), `--prompt-tokens MIN MAX` (prepends a context text of a random
-length in that range to each question). vLLM gets `max_num_batched_tokens = token_budget`.
-Each run is saved to `results/{timestamp}_{impl}.json` with the table, arguments,
-environment, git commit and per-request records.
+Each run creates a folder:
+
+```text
+results/<timestamp>/
+  report.html        # settings, init, results of both engines side by side, per-run details
+  gpu.csv            # nvidia-smi samples every 5 s: temperature, power, clocks, memory
+  results_ours/      # one JSON per configuration, with per-request records
+  results_vllm/
+```
+
+Main arguments: `--title` (required), `--engines` (`ours vllm`), `--kinds` (`short long mixed`),
+`--rates` (`4 8 inf` requests/s), `--repeats` (3), `--n-requests` (500), `--trim` (0.05),
+`--warmup-requests` (16), `--max-new-tokens` (128), `--n-slots` (33), `--page-size` (16),
+`--token-budget` (1024). vLLM gets `max_num_seqs = n_slots - 1` and
+`max_num_batched_tokens = token_budget`.
 
 `n_slots` can be at most one more than the largest bucket (32); slot 0 is the padding slot,
 so at most 32 requests run at once. `token_budget` must be above 128 and a multiple of 32.
 
+**Protocol**:
+
+- Workloads: `short` (30-50 token prompts), `long` (500-1000 tokens), `mixed` (half of each,
+  shuffled). Long prompts are questions with a context built from a fixed set of paragraphs.
+- Arrivals are open-loop Poisson. Prompts are fixed by the seed; arrivals change with each
+  repeat. At `rate=inf` all requests arrive at once, so repeats see identical arrivals.
+- Each engine is built once, warmed up once, and then serves every configuration in the same
+  seeded random order.
+- Latency and throughput skip the first and last 5% of requests by planned arrival time,
+  except at `rate=inf`.
+- Latency is measured from the planned arrival. `send_lag` shows how late the client sent a
+  request, and `ttft_engine` excludes it.
+
 **Accuracy**: before serving, each prompt is generated once with HF (batch 1, greedy,
-`repetition_penalty=1.0`) and cached in `results/reference/`. The table reports `exact%`
-(requests identical to the reference) and `prefix%` (mean length of the common prefix
-relative to the longer output); trailing EOS tokens are ignored.
+`repetition_penalty=1.0`) and cached in `results/reference/`. Reports give the number of
+requests identical to the reference (`exact`) and the mean share of tokens matching up to the
+first difference (`match ratio`), using every request; trailing EOS tokens are ignored. The
+reference is not ground truth: it is also fp16, so a difference is not necessarily an error.
 
 ### Feature benchmarks (`feature_bench/`)
 
@@ -172,6 +194,49 @@ python -m feature_bench.html_report feature_bench/results/<report>.json
   process per token count to keep memory use low.
 
 ## Results
+
+### Serving benchmark against vLLM
+
+Run `results/20261102-142549`, commit `984f70d`: 500 requests per configuration,
+`max_new_tokens=128`, 32 concurrent requests, `token_budget=1024`. Values are `ours | vLLM`,
+the mean of 3 repeats; times are in ms.
+
+| workload | rate | tok/s | ttft_overall | tpot | e2e mean | e2e p99 | exact (of 500) |
+|---|---|---|---|---|---|---|---|
+| short | 4 | 360 \| 360 | 11 \| 32 | 5.97 \| 7.37 | 540 \| 682 | 823 \| 1041 | 432 \| 437 |
+| short | 8 | 715 \| 712 | 11 \| 33 | 6.06 \| 7.65 | 548 \| 710 | 833 \| 1126 | 428 \| 433 |
+| short | inf | 4036 \| 2432 | 4867 \| 8201 | 7.53 \| 12.29 | 5533 \| 9295 | 10884 \| 18184 | 434 \| 419 |
+| long | 4 | 331 \| 331 | 30 \| 48 | 6.72 \| 7.93 | 571 \| 692 | 981 \| 1200 | 441 \| 439 |
+| long | 8 | 657 \| 653 | 32 \| 56 | 7.72 \| 9.35 | 654 \| 809 | 1193 \| 1514 | 442 \| 441 |
+| long | inf | 1957 \| 1665 | 10353 \| 12129 | 15.71 \| 18.08 | 11638 \| 13618 | 21380 \| 25148 | 442 \| 441 |
+| mixed | 4 | 351 \| 350 | 21 \| 39 | 6.31 \| 7.54 | 562 \| 686 | 931 \| 1113 | 428 \| 432 |
+| mixed | 8 | 698 \| 695 | 22 \| 42 | 6.84 \| 8.20 | 608 \| 743 | 1043 \| 1258 | 427 \| 427 |
+| mixed | inf | 2658 \| 2123 | 7670 \| 9698 | 11.59 \| 14.40 | 8646 \| 10908 | 16118 \| 20271 | 430 \| 427 |
+
+- At `rate=inf`, ours has higher throughput: 66% on `short`, 25% on `mixed`, 18% on `long`. The
+  ranges of the 3 repeats do not overlap.
+- At rates 4 and 8, throughput equals the offered load on both engines. Ours has lower tpot
+  (about 15-20%) and e2e (about 15-25%).
+- Part of the TTFT difference comes from the client: vLLM's single-threaded loop can only submit
+  between steps, so its `send_lag` p99 is 15-28 ms against about 2 ms for ours. The difference
+  remains in `ttft_engine` (for example 10.2 | 28.1 ms on `short` at rate 4).
+- Both engines match the HF reference on about 84-89% of requests, with no consistent winner
+  except `short` at `inf`.
+- There were no preemptions. The piecewise backend ran almost all mixed steps on `long`, about
+  half on `mixed`, and few on `short`.
+- Init: ours 462 s with a warm inductor cache, vLLM 44 s. PyTorch reserved 2180 MiB for ours:
+  model 950 MiB, KV cache 385 MiB, graphs and the shared attention buffer 263 MiB.
+- GPU: at most 77 C and 79 W. Under load the median SM clock was 2475 MHz, but some samples
+  dropped to about 1080 MHz with a power-cap flag, and these are not matched to runs yet.
+
+These numbers come from one laptop GPU under WSL, with ours always running first, and from
+synthetic workloads on a small model. They compare the two engines under these conditions and
+do not predict production behavior or other models.
+
+### Earlier measurements (previous benchmark)
+
+These come from the previous benchmark code, which is no longer in the repository; its result
+files are in `results/` and `results/obsolete/`.
 
 > These are not strict or carefully designed benchmarks. They are temporary measurements
 > taken while developing individual features, to check that a change works and roughly how
@@ -274,8 +339,9 @@ process. Ranges are min-max over the batch buckets; rows marked (median) give th
 - `PIECEWISE_TOKEN_STEP = 32` is not based on a measurement.
 - Any compile inside the scheduler thread fails with `FailOnRecompileLimitHit`, so an
   unexpected guard failure during serving stops the loop.
-- On the long-prompt workload, neither the share of steps going to the piecewise backend nor
-  the total memory use is measured.
+- Ours always runs before vLLM, so an order effect is not measured. `gpu.csv` is not yet matched
+  to individual runs, and vLLM's own memory use is only visible there.
+- Reports compare repeats row by row; there is no summary across repeats.
 - Init is slow: every bucket is a separate Dynamo trace and inductor compile, plus captures.
   `torch.cuda.graph` also runs `torch.cuda.synchronize()` and `empty_cache()` on every capture
   (`gc.collect()` only if `torch.compiler.config.force_cudagraph_gc` is set, off by default);
