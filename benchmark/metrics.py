@@ -3,10 +3,16 @@ from collections import Counter
 
 import numpy as np
 
-EngineResult = tuple[list[int], float, float, float]
-TimedResult = tuple[EngineResult, float]
+from scheduler.models import RequestResult
+
 
 FIRST_DIFF_BIN = 16
+
+
+@dataclasses.dataclass
+class TimedResult:
+    result: RequestResult
+    planned: float
 
 
 @dataclasses.dataclass
@@ -34,6 +40,7 @@ class ReferenceMatch:
 
 @dataclasses.dataclass
 class OverallMetrics:
+    n_measured: int
     duration: float
     req_per_s: float
     tok_per_s: float
@@ -43,11 +50,13 @@ class OverallMetrics:
     reference_match: ReferenceMatch
 
 
-def get_metrics(
-        result: EngineResult,
-        planned: float
-) -> RequestMetrics:
-    new_tokens, t_arrival, t_first, t_end = result
+def get_metrics(timed: TimedResult) -> RequestMetrics:
+    result = timed.result
+    planned = timed.planned
+    new_tokens = result.new_tokens
+    t_arrival = result.t_arrival
+    t_first = result.t_first
+    t_end = result.t_end
 
     ttft_engine = t_first - t_arrival
     ttft_overall = t_first - planned
@@ -140,38 +149,39 @@ def summarize_matches(matches: list[TokenMatch]) -> ReferenceMatch:
     )
 
 
+def trim_output(output: list[TimedResult], trim: float) -> list[TimedResult]:
+    ordered = sorted(output, key=lambda timed: timed.planned)
+    cut = int(len(ordered) * trim)
+    return ordered[cut:len(ordered) - cut]
+
+
 def summarize(
         output: list[TimedResult],
         references: list[list[int]],
-        eos_token_ids: set[int]
+        eos_token_ids: set[int],
+        trim: float
 ) -> OverallMetrics:
-    n = len(output)
+    measured = trim_output(output, trim)
+    n = len(measured)
 
     metrics = []
     start = float("inf")
     end = float("-inf")
     total_tokens = 0
 
-    for result, planned in output:
-        metrics.append(
-            get_metrics(
-                result=result,
-                planned=planned
-            )
-        )
+    for timed in measured:
+        metrics.append(get_metrics(timed))
 
-        start = min(start, planned)
-
-        new_tokens, _, _, t_end = result
-        end = max(end, t_end)
-
-        total_tokens += len(new_tokens)
+        start = min(start, timed.planned)
+        end = max(end, timed.result.t_end)
+        total_tokens += len(timed.result.new_tokens)
 
     duration = end - start
     req_per_s = n / duration
     tok_per_s = total_tokens / duration
 
     return OverallMetrics(
+        n_measured=n,
         duration=duration,
         req_per_s=req_per_s,
         tok_per_s=tok_per_s,
@@ -179,7 +189,7 @@ def summarize(
         p50=percentile_metrics(metrics, 50),
         p99=percentile_metrics(metrics, 99),
         reference_match=summarize_matches([
-            compare_tokens(result[0], reference, eos_token_ids)
-            for (result, _), reference in zip(output, references)
+            compare_tokens(timed.result.new_tokens, reference, eos_token_ids)
+            for timed, reference in zip(output, references)
         ])
     )

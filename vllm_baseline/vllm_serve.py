@@ -7,6 +7,7 @@ from vllm.outputs import RequestOutput
 from vllm.sampling_params import RequestOutputKind
 
 from benchmark.metrics import TimedResult
+from scheduler.models import RequestResult
 
 
 @dataclasses.dataclass
@@ -18,7 +19,15 @@ class PendingRequest:
     new_tokens: list[int] = dataclasses.field(default_factory=list)
 
     def result(self) -> TimedResult:
-        return (self.new_tokens, self.t_arrival, self.t_first, self.t_end), self.planned
+        return TimedResult(
+            result=RequestResult(
+                new_tokens=self.new_tokens,
+                t_arrival=self.t_arrival,
+                t_first=self.t_first,
+                t_end=self.t_end
+            ),
+            planned=self.planned
+        )
 
 
 def submit_due(

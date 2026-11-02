@@ -22,6 +22,14 @@ class Request:
 
 
 @dataclass
+class RequestResult:
+    new_tokens: list[int]
+    t_arrival: float
+    t_first: float
+    t_end: float
+
+
+@dataclass
 class ComponentInitStats:
     seconds: float
     memory: int

@@ -7,7 +7,7 @@ import torch
 from typing import ClassVar
 from transformers import AutoModelForCausalLM
 from attn.core import use_triton_attention
-from scheduler.models import ComponentInitStats, Request, Tracker
+from scheduler.models import ComponentInitStats, Request, RequestResult, Tracker
 from kv_cache.storage import KVStorage
 from scheduler.graph_backend import FullGraphBackend, PiecewiseGraphBackend
 
@@ -328,13 +328,14 @@ class Scheduler:
                     token in self.eos_token_ids
                     or len(req.new_tokens) == self.max_new_tokens - 1
             ):
-                t_arrival = req.t_arrival
-                t_first = req.t_first or current
-                new_tokens = req.new_tokens + [token]
-
                 self._complete(
                     req.future,
-                    (new_tokens, t_arrival, t_first, current)
+                    RequestResult(
+                        new_tokens=req.new_tokens + [token],
+                        t_arrival=req.t_arrival,
+                        t_first=req.t_first or current,
+                        t_end=current
+                    )
                 )
 
                 finished_slots.append(slot_id)
@@ -432,7 +433,7 @@ class Scheduler:
         return new_slot_ids, new_required_pages, new_budgets
 
     @staticmethod
-    def _complete(future: Future, result: tuple) -> None:
+    def _complete(future: Future, result: RequestResult) -> None:
         try:
             future.set_result(result)
         except InvalidStateError:

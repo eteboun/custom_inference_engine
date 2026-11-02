@@ -12,7 +12,10 @@ async def send(
 ) -> TimedResult:
     await asyncio.sleep(max(0., planned - time.perf_counter()))
     result = engine.call(request)
-    return await asyncio.wrap_future(result), planned
+    return TimedResult(
+        result=await asyncio.wrap_future(result),
+        planned=planned
+    )
 
 
 async def benchmark(
