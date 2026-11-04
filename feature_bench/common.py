@@ -12,6 +12,7 @@ from kv_cache.storage import KVStorage
 
 
 RESULTS_DIR = Path(__file__).resolve().parent / "results"
+TOKEN_THRESHOLD_RESULTS_DIR = RESULTS_DIR / "token_threshold"
 PAGE_SIZE = 16
 KV_CAPACITY = 32768
 

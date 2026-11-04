@@ -25,7 +25,7 @@ model, and a serving benchmark with Poisson arrivals compares the two.
 | `scheduler/mixed_module.py` | Varlen (prefill + decode) forward: `FullMixedModule` (whole-forward CUDA graph) and `PiecewiseMixedModule` (piecewise CUDA graphs) |
 | `scheduler/graph_backend.py` | `FullGraphBackend` (batch size x token count grid) and `PiecewiseGraphBackend` (token count buckets) |
 | `benchmark/` | Serving benchmark against vLLM (`python -m benchmark`): workloads, clients, metrics, HF greedy reference, reports |
-| `feature_bench/` | Benchmarks of individual features, separate from the vLLM comparison; results in `feature_bench/results/` as JSON and HTML |
+| `feature_bench/` | Benchmarks of individual features, separate from the vLLM comparison; results in `feature_bench/results/` as JSON and HTML. The token threshold measurements are together in `feature_bench/results/token_threshold/` |
 | `vllm_baseline/` | vLLM engine for the same model and benchmark |
 | `results/` | One timestamped folder per benchmark run; `results/reference/` caches HF outputs. The loose JSON files and `results/obsolete/` come from the previous benchmark |
 | `main.py`, `common.py` | Single-prompt measurement helpers (currently only run vLLM) |
@@ -185,6 +185,8 @@ Each benchmark writes a JSON report; `html_report` turns reports into HTML table
 ```bash
 python -m feature_bench.piecewise_vs_full --title "<what this run tests>"
 python -m feature_bench.step_time --title "<what this run tests>" --token-counts 64 128 256
+python -m feature_bench.full_graph_token_jump --title "<what this run tests>" --token-counts 128 129
+python -m feature_bench.gemm_token_steps --title "<what this run tests>" --token-counts 128 129 130
 python -m feature_bench.html_report feature_bench/results/<report>.json
 ```
 
@@ -192,6 +194,16 @@ python -m feature_bench.html_report feature_bench/results/<report>.json
   compares the logits.
 - `step_time`: times `replay()` of both modules for each batch size and token count, with one
   process per token count to keep memory use low.
+- `full_graph_token_jump`: compares exactly two token counts on `FullMixedModule` for each batch size,
+  with one process per token count: `replay()` time as in `step_time`, then kernel times from
+  `torch.profiler`. Writes its HTML report itself.
+- `gemm_token_steps`: runs each projection of the first layer alone (`F.linear` on a random
+  input, compiled and captured as a CUDA graph) for each token count: `replay()` time, kernel
+  times, and `grid` and `block` of each kernel from the Chrome trace. Writes its HTML report
+  itself.
+
+`step_time`, `full_graph_token_jump` and `gemm_token_steps` write to
+`feature_bench/results/token_threshold/`.
 
 ## Results
 
@@ -311,17 +323,77 @@ process. Ranges are min-max over the batch buckets; rows marked (median) give th
 | 256-512 | 9.0-14.1 | 9.0-14.1 | mostly < 2% |
 
 - Piecewise stays at about 6.2-6.7 ms up to 128 tokens, regardless of the token count.
-- Full graph time rises by about 1 ms between 128 and 132 tokens and is nearly flat from 132
-  to 148. The overhead is 13-28% at 128 tokens and about 4-5% (median) from 132 to 156.
+- Full graph time rises by about 1 ms between 128 and 132 tokens (already at 129, see below)
+  and is nearly flat from 132 to 148. The overhead is 13-28% at 128 tokens and about 4-5%
+  (median) from 132 to 156.
 - The batch size has little effect on the overhead above 128 tokens.
 - This is why steps of up to 128 tokens use the full graph and larger ones the piecewise
-  backend. Raw numbers and tables are in `feature_bench/results/`.
+  backend.
+
+**The full graph jump after 128 tokens**: the step-time run has no token count between 128 and
+132, so the forward was also measured at 129 (`full_graph_token_jump`), with the same batch
+buckets and KV context. Times are in ms.
+
+| B | replay T=128 | replay T=129 | replay difference | total kernel time difference |
+|---|---|---|---|---|
+| 1 | 5.282 | 6.204 | 0.922 | 0.968 |
+| 2 | 5.249 | 6.212 | 0.963 | 1.080 |
+| 4 | 5.260 | 6.323 | 1.063 | 1.143 |
+| 8 | 5.420 | 6.340 | 0.919 | 0.956 |
+| 16 | 5.505 | 6.407 | 0.902 | 0.894 |
+| 32 | 5.657 | 6.584 | 0.927 | 0.969 |
+
+The two differences are within 0.12 ms of each other at every batch size. cuBLAS runs a
+different kernel for every projection at the two token counts. Kernel time per replay at
+`B = 1`, in us; the profiler does not name the projection, so kernels are assigned to
+projections by matching their names with the run of each projection alone below:
+
+| projection (calls) | T=128 kernel | time | T=129 kernel | time |
+|---|---|---|---|---|
+| gate + up (48) | `s1688gemm 128x128` | 2460 | `s16816gemm_relu 128x64` | 2936 |
+| down (24) | `s16816gemm 128x128` + `splitKreduce` | 1177 | `s1688gemm 256x64` | 1470 |
+| QKV (24) | `wmma 32x32` | 319 | `s16816gemm_relu 128x64` | 394 |
+| o_proj (24) | `s16816gemm 64x64` | 240 | `wmma 32x32` | 304 |
+| total | | 4196 | | 5104 |
+
+Each projection alone (`gemm_token_steps`), total kernel time per call in us:
+
+| projection | T=128 | T=129 | T=130 | T=131 | T=132 |
+|---|---|---|---|---|---|
+| gate | 37.8 | 53.7 | 53.5 | 53.7 | 55.2 |
+| up | 37.6 | 53.6 | 53.6 | 53.6 | 55.3 |
+| down | 33.7 | 51.4 | 51.2 | 51.3 | 54.5 |
+| QKV | 12.4 | 15.1 | 14.9 | 15.6 | 15.7 |
+| o_proj | 8.5 | 12.0 | 12.0 | 12.0 | 15.2 |
+
+- From 129 to 131 the kernels do not change and the times stay nearly constant. At 132, gate,
+  up and down keep their GEMM kernel and gain a 1.4-3.1 us Triton kernel.
+- o_proj changes kernel twice: at 129, and at 132 to `s16816gemm 128x64`.
+- The step is larger alone than in the forward: gate + up rise by about 16 us per call alone and
+  about 10 us per call in the forward.
+
+`grid` of each GEMM kernel, from the Chrome trace of each projection alone (`block` is
+`[128, 1, 1]` for all of them):
+
+| projection | T=128 | T=129 |
+|---|---|---|
+| gate, up | `[38, 1, 3]` | `[24, 5, 1]` |
+| down | `[7, 1, 5]` | `[4, 3, 3]` |
+| QKV | `[32, 5, 1]` | `[9, 3, 1]` |
+| o_proj | `[14, 2, 1]` | `[40, 4, 1]` |
+
+Reports are in `feature_bench/results/token_threshold/`: `20261104-084454` (forward at 128 and
+129), `20261103-203424` (forward at 128 and 132), `20261103-204246` (each projection alone) and
+`20261103-211327` (`grid` and `block`). They were taken from uncommitted code on top of `02058ce`
+and are marked as dirty.
 
 ## Known gaps
 
 - The token threshold was measured with a fixed KV context of 256 tokens and timing only
   the replay; the 0.1-0.3 ms that remains above 128 tokens is not broken down.
 - `PIECEWISE_TOKEN_STEP = 32` is not based on a measurement.
+- Why cuBLAS selects different kernels past 128 tokens, and why the step is larger for a
+  projection alone than in the forward, is not known.
 - Any compile inside the scheduler thread fails with `FailOnRecompileLimitHit`, so an
   unexpected guard failure during serving stops the loop.
 - Ours always runs before vLLM, so an order effect is not measured. `gpu.csv` is not yet matched

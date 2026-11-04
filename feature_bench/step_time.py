@@ -9,15 +9,21 @@ from pathlib import Path
 
 import torch
 
-from feature_bench.common import PAGE_SIZE, RESULTS_DIR, assign_pages, build_kv, load_model, save_report
+from feature_bench.common import PAGE_SIZE, TOKEN_THRESHOLD_RESULTS_DIR, assign_pages, build_kv, load_model, save_report
 from scheduler.graph_backend import PiecewiseGraphBackend
-from scheduler.mixed_module import FullMixedModule
+from scheduler.mixed_module import FullMixedModule, MixedModule
 
 
 WARMUP_REPLAYS = 5
 
 
-def timed(module, prompts, slot_ids, iters: int, repeats: int) -> tuple[float, float]:
+def timed(
+        module: MixedModule,
+        prompts: list[list[int]],
+        slot_ids: list[int],
+        iters: int,
+        repeats: int
+) -> tuple[float, float]:
     with torch.inference_mode():
         module.upload(prompts, slot_ids)
         for _ in range(WARMUP_REPLAYS):
@@ -38,7 +44,7 @@ def timed(module, prompts, slot_ids, iters: int, repeats: int) -> tuple[float, f
     return statistics.median(samples), statistics.pstdev(samples)
 
 
-def run_worker(args) -> None:
+def run_worker(args: argparse.Namespace) -> None:
     token_count = args.worker
     batch_sizes = [b for b in args.batch_sizes if b <= token_count]
     n_slots = max(args.batch_sizes) + 1
@@ -46,17 +52,17 @@ def run_worker(args) -> None:
     torch._dynamo.config.recompile_limit = 256
 
     model = load_model()
-    kv = build_kv(model, n_slots)
+    kv = build_kv(model, n_slots=n_slots)
     pool = torch.cuda.graph_pool_handle()
 
-    piecewise = PiecewiseGraphBackend(model, kv, [token_count], pool)
+    piecewise = PiecewiseGraphBackend(model=model, kv_cache=kv, token_counts=[token_count], pool=pool)
     full = {
-        b: FullMixedModule(model, kv, batch_size=b, token_count=token_count, pool=pool)
+        b: FullMixedModule(model=model, kv_cache=kv, batch_size=b, token_count=token_count, pool=pool)
         for b in sorted(batch_sizes, reverse=True)
     }
 
     pages_per_slot = math.ceil((args.context + max(args.token_counts)) / PAGE_SIZE)
-    assign_pages(kv, list(range(1, n_slots)), pages_per_slot, args.context)
+    assign_pages(kv, slot_ids=list(range(1, n_slots)), pages_per_slot=pages_per_slot, context=args.context)
 
     with open(args.worker_out, "a") as f:
         for b in batch_sizes:
@@ -64,9 +70,15 @@ def run_worker(args) -> None:
             prompts = [[1000 + i] * n for i, n in enumerate(lens)]
             slot_ids = list(range(1, b + 1))
 
-            full_ms, full_sd = timed(full[b], prompts, slot_ids, args.iters, args.repeats)
+            full_ms, full_sd = timed(
+                full[b], prompts=prompts, slot_ids=slot_ids, iters=args.iters, repeats=args.repeats
+            )
             piecewise_ms, piecewise_sd = timed(
-                piecewise.get_mixed_module(token_count), prompts, slot_ids, args.iters, args.repeats
+                piecewise.get_mixed_module(token_count),
+                prompts=prompts,
+                slot_ids=slot_ids,
+                iters=args.iters,
+                repeats=args.repeats
             )
 
             row = {
@@ -109,7 +121,7 @@ def build_tables(rows: list[dict]) -> list[dict]:
     ]
 
 
-def main():
+def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--title", default=None)
     parser.add_argument("--batch-sizes", type=int, nargs="+", default=[1, 2, 4, 8, 16, 32])
@@ -117,7 +129,7 @@ def main():
     parser.add_argument("--context", type=int, default=256)
     parser.add_argument("--iters", type=int, default=50)
     parser.add_argument("--repeats", type=int, default=7)
-    parser.add_argument("--results-dir", type=Path, default=RESULTS_DIR)
+    parser.add_argument("--results-dir", type=Path, default=TOKEN_THRESHOLD_RESULTS_DIR)
     parser.add_argument("--worker", type=int, default=None)
     parser.add_argument("--worker-out", default=None)
     args = parser.parse_args()
@@ -150,17 +162,17 @@ def main():
             rows = [json.loads(line) for line in f]
 
     path = save_report(
-        "step_time",
-        args.title,
-        {
+        name="step_time",
+        title=args.title,
+        settings={
             "batch_sizes": args.batch_sizes,
             "token_counts": args.token_counts,
             "context": args.context,
             "iters": args.iters,
             "repeats": args.repeats,
         },
-        build_tables(rows),
-        args.results_dir
+        tables=build_tables(rows),
+        results_dir=args.results_dir
     )
     print(f"saved: {path}")
 
