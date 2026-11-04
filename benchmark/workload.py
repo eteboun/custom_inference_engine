@@ -108,18 +108,23 @@ def chat_template_parts(tokenizer) -> tuple[list[int], list[int]]:
     )
 
 
-def short_prompt(tokenizer, rng: np.random.Generator) -> list[int]:
+def short_prompt(tokenizer, rng: np.random.Generator, questions: list[str] = QUESTIONS) -> list[int]:
     head, tail = chat_template_parts(tokenizer)
     while True:
-        question = QUESTIONS[rng.integers(len(QUESTIONS))]
+        question = questions[rng.integers(len(questions))]
         prompt = head + tokenizer.encode(question, add_special_tokens=False) + tail
         if SHORT_TOKENS[0] <= len(prompt) <= SHORT_TOKENS[1]:
             return prompt
 
 
-def long_prompt(tokenizer, rng: np.random.Generator) -> list[int]:
+def long_prompt(
+        tokenizer,
+        rng: np.random.Generator,
+        questions: list[str] = QUESTIONS,
+        paragraphs: list[str] = CONTEXT_PARAGRAPHS
+) -> list[int]:
     head, tail = chat_template_parts(tokenizer)
-    question = QUESTIONS[rng.integers(len(QUESTIONS))]
+    question = questions[rng.integers(len(questions))]
 
     intro = tokenizer.encode(
         "Read the following text, then answer the question.\n\n",
@@ -135,9 +140,9 @@ def long_prompt(tokenizer, rng: np.random.Generator) -> list[int]:
 
     context = []
     while len(context) < n_context:
-        paragraphs = rng.permutation(CONTEXT_PARAGRAPHS).tolist()
+        shuffled = rng.permutation(paragraphs).tolist()
         context += tokenizer.encode(
-            "\n\n".join(paragraphs) + "\n\n",
+            "\n\n".join(shuffled) + "\n\n",
             add_special_tokens=False
         )
 
@@ -148,15 +153,17 @@ def build_workload(
         tokenizer,
         kind: str,
         n: int,
-        seed: int
+        seed: int,
+        questions: list[str] = QUESTIONS,
+        paragraphs: list[str] = CONTEXT_PARAGRAPHS
 ) -> tuple[list[list[int]], WorkloadInfo]:
 
     n_long = {"short": 0, "long": n, "mixed": n // 2}[kind]
     n_short = n - n_long
 
     rng = np.random.default_rng(seed)
-    prompts = [short_prompt(tokenizer, rng) for _ in range(n_short)]
-    prompts += [long_prompt(tokenizer, rng) for _ in range(n_long)]
+    prompts = [short_prompt(tokenizer, rng, questions) for _ in range(n_short)]
+    prompts += [long_prompt(tokenizer, rng, questions, paragraphs) for _ in range(n_long)]
     rng.shuffle(prompts)
 
     info = WorkloadInfo(

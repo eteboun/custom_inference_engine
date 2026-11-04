@@ -11,10 +11,10 @@ import torch
 import torch.nn.functional as F
 from torch.profiler import ProfilerActivity, profile
 
-from feature_bench.common import TOKEN_THRESHOLD_RESULTS_DIR, load_model, save_report
-from feature_bench.html_report import render_report
+from feature_bench.common import load_model, save_report
 
 
+RESULTS_DIR = Path(__file__).resolve().parent / "results"
 TOKEN_COUNTS = [128, 129, 130, 131, 132]
 WARMUP_REPLAYS = 20
 WARMUP_COMPILED_CALLS = 3
@@ -51,24 +51,27 @@ class GemmModule:
         self.graph.replay()
 
 
-def build_modules(token_count: int) -> dict[str, GemmModule]:
-    torch._dynamo.config.recompile_limit = 256
-    torch.manual_seed(0)
-
-    model = load_model()
+def first_layer_projections(model) -> dict[str, tuple[torch.Tensor, torch.Tensor | None]]:
     layer = model.model.layers[0]
     attention = layer.self_attn
 
-    projections = {
-        "qkv": (attention.qkv_weight, attention.qkv_bias),
+    return {
+        "qkv": (attention.qkv.weight, attention.qkv.bias),
         "o_proj": (attention.original.o_proj.weight, attention.original.o_proj.bias),
         "gate_proj": (layer.mlp.gate_proj.weight, layer.mlp.gate_proj.bias),
         "up_proj": (layer.mlp.up_proj.weight, layer.mlp.up_proj.bias),
         "down_proj": (layer.mlp.down_proj.weight, layer.mlp.down_proj.bias),
     }
+
+
+def build_modules(token_count: int) -> dict[str, GemmModule]:
+    torch._dynamo.config.recompile_limit = 256
+    torch.manual_seed(0)
+
+    model = load_model()
     return {
         name: GemmModule(weight=weight, bias=bias, token_count=token_count)
-        for name, (weight, bias) in projections.items()
+        for name, (weight, bias) in first_layer_projections(model).items()
     }
 
 
@@ -193,7 +196,7 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--title", default=None)
     parser.add_argument("--token-counts", type=int, nargs="+", default=TOKEN_COUNTS)
-    parser.add_argument("--results-dir", type=Path, default=TOKEN_THRESHOLD_RESULTS_DIR)
+    parser.add_argument("--results-dir", type=Path, default=RESULTS_DIR)
     parser.add_argument("--worker", type=int, default=None)
     parser.add_argument("--worker-out", type=Path, default=None)
     args = parser.parse_args()
@@ -210,7 +213,7 @@ def main() -> None:
         for token_count in sorted(args.token_counts, reverse=True):
             subprocess.run(
                 [
-                    sys.executable, "-m", "feature_bench.gemm_token_steps",
+                    sys.executable, "-m", "feature_bench.token_threshold.gemm_token_steps",
                     "--worker", str(token_count),
                     "--worker-out", str(worker_out),
                 ],
@@ -233,14 +236,6 @@ def main() -> None:
         results_dir=args.results_dir
     )
     print(f"saved: {path}")
-
-    with open(path, encoding="utf-8") as f:
-        report = json.load(f)
-
-    output = path.with_suffix(".html")
-    with open(output, "w", encoding="utf-8") as f:
-        f.write(render_report(report))
-    print(f"saved: {output}")
 
 
 if __name__ == "__main__":

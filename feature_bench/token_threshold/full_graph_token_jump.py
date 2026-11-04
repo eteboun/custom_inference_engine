@@ -9,13 +9,13 @@ from pathlib import Path
 import torch
 from torch.profiler import ProfilerActivity, profile
 
-from feature_bench.common import TOKEN_THRESHOLD_RESULTS_DIR, assign_pages, build_kv, load_model, save_report
-from feature_bench.html_report import render_report
-from feature_bench.step_time import WARMUP_REPLAYS, timed
+from feature_bench.common import assign_pages, build_kv, load_model, save_report
+from feature_bench.token_threshold.step_time import WARMUP_REPLAYS, timed
 from kv_cache.storage import KVStorage
 from scheduler.mixed_module import FullMixedModule
 
 
+RESULTS_DIR = Path(__file__).resolve().parent / "results"
 BATCH_SIZES = [1, 2, 4, 8, 16, 32]
 TOKEN_COUNTS = [128, 132]
 CONTEXT = 256
@@ -169,7 +169,7 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--title", default=None)
     parser.add_argument("--token-counts", type=int, nargs=2, default=TOKEN_COUNTS)
-    parser.add_argument("--results-dir", type=Path, default=TOKEN_THRESHOLD_RESULTS_DIR)
+    parser.add_argument("--results-dir", type=Path, default=RESULTS_DIR)
     parser.add_argument("--worker", type=int, default=None)
     parser.add_argument("--worker-out", type=Path, default=None)
     args = parser.parse_args()
@@ -186,7 +186,7 @@ def main() -> None:
         for token_count in sorted(args.token_counts, reverse=True):
             subprocess.run(
                 [
-                    sys.executable, "-m", "feature_bench.full_graph_token_jump",
+                    sys.executable, "-m", "feature_bench.token_threshold.full_graph_token_jump",
                     "--worker", str(token_count),
                     "--worker-out", str(worker_out),
                 ],
@@ -212,14 +212,6 @@ def main() -> None:
         results_dir=args.results_dir
     )
     print(f"saved: {path}")
-
-    with open(path, encoding="utf-8") as f:
-        report = json.load(f)
-
-    output = path.with_suffix(".html")
-    with open(output, "w", encoding="utf-8") as f:
-        f.write(render_report(report))
-    print(f"saved: {output}")
 
 
 if __name__ == "__main__":

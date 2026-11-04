@@ -17,6 +17,7 @@ model, and a serving benchmark with Poisson arrivals compares the two.
 | `kernels/prefill_attention.py` | Varlen GQA mixed attention: chunked prefill and decode in one kernel |
 | `attn/core.py` | Kernel host functions, `triton_op` wrappers, `TritonQwen2Attention` replacing HF `Qwen2Attention` |
 | `attn/metadata.py` | Attention metadata passed to the forward (slot ids, `cu_seqlens`, pages/offsets) |
+| `quant/` | fp8 projections: `Fp8Linear` (`torch._scaled_mm`), `use_fp8`, and calibration of the input scales |
 | `piecewise/` | Piecewise `torch.compile` backend: splits the graph at attention, captures the other pieces as CUDA graphs |
 | `kv_cache/storage.py` | Paged KV pool, block table, per-slot length and last generated token |
 | `scheduler/scheduler.py` | Thread-based scheduler: queue, token budget, page allocation, preemption |
@@ -25,7 +26,7 @@ model, and a serving benchmark with Poisson arrivals compares the two.
 | `scheduler/mixed_module.py` | Varlen (prefill + decode) forward: `FullMixedModule` (whole-forward CUDA graph) and `PiecewiseMixedModule` (piecewise CUDA graphs) |
 | `scheduler/graph_backend.py` | `FullGraphBackend` (batch size x token count grid) and `PiecewiseGraphBackend` (token count buckets) |
 | `benchmark/` | Serving benchmark against vLLM (`python -m benchmark`): workloads, clients, metrics, HF greedy reference, reports |
-| `feature_bench/` | Benchmarks of individual features, separate from the vLLM comparison; results in `feature_bench/results/` as JSON and HTML. The token threshold measurements are together in `feature_bench/results/token_threshold/` |
+| `feature_bench/` | Benchmarks of individual features, separate from the vLLM comparison. One folder per feature (`token_threshold/`, `piecewise/`, `fp8/`), each with its scripts and a `results/` folder of JSON and HTML reports |
 | `vllm_baseline/` | vLLM engine for the same model and benchmark |
 | `results/` | One timestamped folder per benchmark run; `results/reference/` caches HF outputs. The loose JSON files and `results/obsolete/` come from the previous benchmark |
 | `main.py`, `common.py` | Single-prompt measurement helpers (currently only run vLLM) |
@@ -180,14 +181,15 @@ reference also runs in fp16.
 
 ### Feature benchmarks (`feature_bench/`)
 
-Each benchmark writes a JSON report; `html_report` turns reports into HTML tables:
+Each benchmark writes a JSON and an HTML report to the `results/` folder of its feature:
 
 ```bash
-python -m feature_bench.piecewise_vs_full --title "<what this run tests>"
-python -m feature_bench.step_time --title "<what this run tests>" --token-counts 64 128 256
-python -m feature_bench.full_graph_token_jump --title "<what this run tests>" --token-counts 128 129
-python -m feature_bench.gemm_token_steps --title "<what this run tests>" --token-counts 128 129 130
-python -m feature_bench.html_report feature_bench/results/<report>.json
+python -m feature_bench.piecewise.piecewise_vs_full --title "<what this run tests>"
+python -m feature_bench.token_threshold.step_time --title "<what this run tests>" --token-counts 64 128 256
+python -m feature_bench.token_threshold.full_graph_token_jump --title "<what this run tests>" --token-counts 128 129
+python -m feature_bench.token_threshold.gemm_token_steps --title "<what this run tests>" --token-counts 128 129 130
+python -m feature_bench.fp8.fp8_gemm --title "<what this run tests>" --token-counts 16 64 128
+python -m feature_bench.fp8.decode_kernels --title "<what this run tests>"
 ```
 
 - `piecewise_vs_full`: runs the same inputs through full graph and piecewise mixed modules and
@@ -196,14 +198,15 @@ python -m feature_bench.html_report feature_bench/results/<report>.json
   process per token count to keep memory use low.
 - `full_graph_token_jump`: compares exactly two token counts on `FullMixedModule` for each batch size,
   with one process per token count: `replay()` time as in `step_time`, then kernel times from
-  `torch.profiler`. Writes its HTML report itself.
+  `torch.profiler`.
 - `gemm_token_steps`: runs each projection of the first layer alone (`F.linear` on a random
   input, compiled and captured as a CUDA graph) for each token count: `replay()` time, kernel
-  times, and `grid` and `block` of each kernel from the Chrome trace. Writes its HTML report
-  itself.
-
-`step_time`, `full_graph_token_jump` and `gemm_token_steps` write to
-`feature_bench/results/token_threshold/`.
+  times, and `grid` and `block` of each kernel from the Chrome trace.
+- `fp8_gemm`: runs each projection of the first layer alone as fp16 `F.linear` and as fp8
+  `torch._scaled_mm`, compiled and captured as a CUDA graph, with three fp8 variants: the
+  multiply alone, input quantization with a fixed scale, and with a scale computed each call.
+- `decode_kernels`: times `replay()` of `DecodeModule` for each batch bucket and gives its kernel
+  times, for the fp16 model and the fp8 model with fixed scales, with one process per model.
 
 ## Results
 
@@ -382,12 +385,39 @@ Each projection alone (`gemm_token_steps`), total kernel time per call in us:
 | QKV | `[32, 5, 1]` | `[9, 3, 1]` |
 | o_proj | `[14, 2, 1]` | `[40, 4, 1]` |
 
-Reports are in `feature_bench/results/token_threshold/`: `20261104-084454` (forward at 128 and
+Reports are in `feature_bench/token_threshold/results/`: `20261104-084454` (forward at 128 and
 129), `20261103-203424` (forward at 128 and 132), `20261103-204246` (each projection alone) and
 `20261103-211327` (`grid` and `block`). They were taken from uncommitted code on top of `02058ce`
 and are marked as dirty.
 
+### fp8 projections
+
+`load_model(fp8=True)` loads the plain HF model and replaces `o_proj`, `gate_proj`, `up_proj` and
+`down_proj` with `Fp8Linear`, and builds one for the merged Q/K/V projection. The largest input of
+each projection is recorded while generating from 16 calibration prompts that are separate from
+the benchmark prompts (`quant/calibration.py`). Input scales are that value / 448, times 1.1, and
+stay fixed afterwards. `lm_head`, attention and KV stay fp16.
+
+Decode forward at each batch bucket (`decode_kernels`, KV context of 256 tokens), per replay in
+ms, `fp16 | fp8`. `matmul, 24+ calls` are the kernels called at least 24 times per replay:
+
+| B | replay | total kernel time | matmul, 24+ calls |
+|---|---|---|---|
+| 1 | 4.653 \| 3.101 | 4.682 \| 3.111 | 3.333 \| 1.729 |
+| 2 | 4.516 \| 3.247 | 4.536 \| 3.193 | 3.165 \| 1.771 |
+| 4 | 4.587 \| 3.275 | 4.588 \| 3.218 | 3.175 \| 1.755 |
+| 8 | 4.689 \| 3.362 | 4.701 \| 3.311 | 3.200 \| 1.775 |
+| 16 | 4.915 \| 3.532 | 4.917 \| 3.459 | 3.247 \| 1.778 |
+| 32 | 5.316 \| 3.854 | 5.281 \| 3.798 | 3.271 \| 1.817 |
+
+Calibration took 39 s. Reports are in `feature_bench/fp8/results/`: `20261104-132929` (above),
+`20261104-104104` and `20261104-105012` (each projection alone). They were taken from uncommitted
+code on top of `6eadcfa` and are marked as dirty.
+
 ## Known gaps
+
+- The effect of fp8 on output quality has not been measured, and the serving benchmark has not been
+  run with fp8.
 
 - The token threshold was measured with a fixed KV context of 256 tokens and timing only
   the replay; the 0.1-0.3 ms that remains above 128 tokens is not broken down.

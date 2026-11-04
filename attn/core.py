@@ -136,6 +136,18 @@ def gqa_mixed_attention_op(
                                block_table=block_table, kv_lens=kv_lens,
                                slot_ids=slot_ids, wrap=wrap_triton)
 
+def _merge_projections(projs: list[torch.nn.Linear]) -> torch.nn.Linear:
+    weight = torch.cat([p.weight for p in projs]).detach()
+    bias = torch.cat([p.bias for p in projs]).detach()
+
+    merged = torch.nn.Linear(
+        weight.shape[1], weight.shape[0], dtype=weight.dtype, device=weight.device
+    )
+    merged.weight = torch.nn.Parameter(weight, requires_grad=False)
+    merged.bias = torch.nn.Parameter(bias, requires_grad=False)
+    return merged
+
+
 class TritonQwen2Attention(torch.nn.Module):
     def __init__(self, original_attn):
         super().__init__()
@@ -150,14 +162,9 @@ class TritonQwen2Attention(torch.nn.Module):
         projs = [original_attn.q_proj, original_attn.k_proj, original_attn.v_proj]
         assert all(p.bias is not None for p in projs)
         self.qkv_sizes = [p.out_features for p in projs]
-        with torch.no_grad():
-            self.register_buffer(
-                "qkv_weight", torch.cat([p.weight for p in projs]), persistent=False
-            )
-            self.register_buffer(
-                "qkv_bias", torch.cat([p.bias for p in projs]), persistent=False
-            )
-        self.fuse_qkv = True
+        self.qkv = getattr(original_attn, "qkv_fp8", None)
+        if self.qkv is None:
+            self.qkv = _merge_projections(projs)
 
     def forward(self, hidden_states, position_embeddings, attention_mask=None,
                 past_key_values=None, kv_manager=None, **kwargs):
@@ -173,17 +180,10 @@ class TritonQwen2Attention(torch.nn.Module):
                 "'metadata' is required with custom kv_manager."
             )
 
-        # hidden_states: (1, totalT, hidden_size)
-
         attn = self.original
         total_T = hidden_states.shape[1]
         hidden_shape = (1, total_T, -1, self.head_dim)
-        if self.fuse_qkv:
-            q, k, v = torch.nn.functional.linear(
-                hidden_states, self.qkv_weight, self.qkv_bias
-            ).split(self.qkv_sizes, dim=-1)
-        else:
-            q, k, v = attn.q_proj(hidden_states), attn.k_proj(hidden_states), attn.v_proj(hidden_states)
+        q, k, v = self.qkv(hidden_states).split(self.qkv_sizes, dim=-1)
 
         # (1, total_T, H, D)
         query_states = q.view(hidden_shape)

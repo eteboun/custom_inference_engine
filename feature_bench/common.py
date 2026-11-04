@@ -1,26 +1,36 @@
 import json
+import time
 from datetime import datetime
 from pathlib import Path
 
 import torch
-from transformers import AutoModelForCausalLM
+from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from attn.core import use_triton_attention
 from benchmark.report import environment, git_state
 from common import MODEL_ID
+from feature_bench.html_report import render_report
 from kv_cache.storage import KVStorage
+from quant.calibration import calibrate
+from quant.core import use_fp8
 
 
-RESULTS_DIR = Path(__file__).resolve().parent / "results"
-TOKEN_THRESHOLD_RESULTS_DIR = RESULTS_DIR / "token_threshold"
 PAGE_SIZE = 16
 KV_CAPACITY = 32768
 
 
-def load_model():
+def load_model(fp8: bool = False):
     model = AutoModelForCausalLM.from_pretrained(
         MODEL_ID, dtype=torch.float16
     ).to("cuda").eval()
+    model.calibration_seconds = None
+    if fp8:
+        use_fp8(model)
+        tokenizer = AutoTokenizer.from_pretrained(MODEL_ID)
+        start = time.perf_counter()
+        calibrate(model, tokenizer)
+        torch.cuda.synchronize()
+        model.calibration_seconds = time.perf_counter() - start
     use_triton_attention(model)
     return model
 
@@ -46,18 +56,25 @@ def assign_pages(kv: KVStorage, slot_ids: list[int], pages_per_slot: int, contex
         kv.lens[slot] = context
 
 
-def save_report(name: str, title: str, settings: dict, tables: list[dict], results_dir: Path = RESULTS_DIR) -> Path:
+def save_report(name: str, title: str, settings: dict, tables: list[dict], results_dir: Path) -> Path:
     results_dir.mkdir(parents=True, exist_ok=True)
     now = datetime.now()
     path = results_dir / f"{now:%Y%m%d-%H%M%S}_{name}.json"
+    report = {
+        "title": title,
+        "benchmark": name,
+        "timestamp": now.isoformat(timespec="seconds"),
+        "git": git_state(),
+        "env": environment("ours"),
+        "settings": settings,
+        "tables": tables,
+    }
     with open(path, "w") as f:
-        json.dump({
-            "title": title,
-            "benchmark": name,
-            "timestamp": now.isoformat(timespec="seconds"),
-            "git": git_state(),
-            "env": environment("ours"),
-            "settings": settings,
-            "tables": tables,
-        }, f)
+        json.dump(report, f)
+
+    html_path = path.with_suffix(".html")
+    with open(html_path, "w", encoding="utf-8") as f:
+        f.write(render_report(report))
+    print(f"saved: {html_path}")
+
     return path

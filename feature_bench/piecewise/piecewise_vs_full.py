@@ -5,11 +5,12 @@ from pathlib import Path
 import torch
 import torch._dynamo.utils as dynamo_utils
 
-from feature_bench.common import RESULTS_DIR, assign_pages, build_kv, load_model, save_report
+from feature_bench.common import assign_pages, build_kv, load_model, save_report
 from scheduler.graph_backend import PiecewiseGraphBackend
 from scheduler.mixed_module import FullMixedModule
 
 
+RESULTS_DIR = Path(__file__).resolve().parent / "results"
 N_SLOTS = 9
 PAGES_PER_SLOT = 64
 TOKEN_COUNTS = [160, 192, 224, 256]

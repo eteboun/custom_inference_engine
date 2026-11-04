@@ -9,11 +9,12 @@ from pathlib import Path
 
 import torch
 
-from feature_bench.common import PAGE_SIZE, TOKEN_THRESHOLD_RESULTS_DIR, assign_pages, build_kv, load_model, save_report
+from feature_bench.common import PAGE_SIZE, assign_pages, build_kv, load_model, save_report
 from scheduler.graph_backend import PiecewiseGraphBackend
 from scheduler.mixed_module import FullMixedModule, MixedModule
 
 
+RESULTS_DIR = Path(__file__).resolve().parent / "results"
 WARMUP_REPLAYS = 5
 
 
@@ -129,7 +130,7 @@ def main() -> None:
     parser.add_argument("--context", type=int, default=256)
     parser.add_argument("--iters", type=int, default=50)
     parser.add_argument("--repeats", type=int, default=7)
-    parser.add_argument("--results-dir", type=Path, default=TOKEN_THRESHOLD_RESULTS_DIR)
+    parser.add_argument("--results-dir", type=Path, default=RESULTS_DIR)
     parser.add_argument("--worker", type=int, default=None)
     parser.add_argument("--worker-out", default=None)
     args = parser.parse_args()
@@ -146,7 +147,7 @@ def main() -> None:
         for token_count in sorted(args.token_counts, reverse=True):
             subprocess.run(
                 [
-                    sys.executable, "-m", "feature_bench.step_time",
+                    sys.executable, "-m", "feature_bench.token_threshold.step_time",
                     "--batch-sizes", *map(str, args.batch_sizes),
                     "--token-counts", *map(str, args.token_counts),
                     "--context", str(args.context),
