@@ -1,7 +1,10 @@
 import torch
 
+from attn.core import merge_projections
+
 
 FP8_MAX = 448
+ALL_PROJECTIONS = frozenset({"qkv", "o_proj", "gate_proj", "up_proj", "down_proj"})
 
 
 def get_scale(x: torch.Tensor) -> torch.Tensor:
@@ -53,25 +56,26 @@ class Fp8Linear(torch.nn.Module):
         ).view(*x.shape[:-1], -1)
 
 
-def use_fp8(model) -> None:
+def use_fp8(model, projections: frozenset[str] = ALL_PROJECTIONS) -> None:
     for layer in model.model.layers:
         attention = layer.self_attn
-        attention.o_proj = Fp8Linear(attention.o_proj.weight, attention.o_proj.bias)
 
-        projections = [attention.q_proj, attention.k_proj, attention.v_proj]
-        qkv_fp8 = Fp8Linear(
-            torch.cat([p.weight for p in projections]),
-            torch.cat([p.bias for p in projections])
-        )
-        attention.qkv_fp8 = qkv_fp8
-        attention.q_proj.register_forward_pre_hook(
-            lambda _, args, qkv_fp8=qkv_fp8: qkv_fp8.observe(args[0])
-        )
+        if "o_proj" in projections:
+            attention.o_proj = Fp8Linear(attention.o_proj.weight, attention.o_proj.bias)
+
+        if "qkv" in projections:
+            merged = merge_projections([attention.q_proj, attention.k_proj, attention.v_proj])
+            qkv_fp8 = Fp8Linear(merged.weight, merged.bias)
+            attention.qkv_fp8 = qkv_fp8
+            attention.q_proj.register_forward_pre_hook(
+                lambda _, args, qkv_fp8=qkv_fp8: qkv_fp8.observe(args[0])
+            )
 
         mlp = layer.mlp
         for name in ("gate_proj", "up_proj", "down_proj"):
-            linear = getattr(mlp, name)
-            setattr(mlp, name, Fp8Linear(linear.weight, linear.bias))
+            if name in projections:
+                linear = getattr(mlp, name)
+                setattr(mlp, name, Fp8Linear(linear.weight, linear.bias))
 
 
 def finalize_fp8_scales(model, margin: float) -> None:

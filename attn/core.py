@@ -136,7 +136,7 @@ def gqa_mixed_attention_op(
                                block_table=block_table, kv_lens=kv_lens,
                                slot_ids=slot_ids, wrap=wrap_triton)
 
-def _merge_projections(projs: list[torch.nn.Linear]) -> torch.nn.Linear:
+def merge_projections(projs: list[torch.nn.Linear]) -> torch.nn.Linear:
     weight = torch.cat([p.weight for p in projs]).detach()
     bias = torch.cat([p.bias for p in projs]).detach()
 
@@ -164,7 +164,7 @@ class TritonQwen2Attention(torch.nn.Module):
         self.qkv_sizes = [p.out_features for p in projs]
         self.qkv = getattr(original_attn, "qkv_fp8", None)
         if self.qkv is None:
-            self.qkv = _merge_projections(projs)
+            self.qkv = merge_projections(projs)
 
     def forward(self, hidden_states, position_embeddings, attention_mask=None,
                 past_key_values=None, kv_manager=None, **kwargs):

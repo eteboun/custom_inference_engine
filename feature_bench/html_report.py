@@ -23,7 +23,7 @@ def format_value(value) -> str:
     if value is None:
         return "&ndash;"
     if isinstance(value, float):
-        return f"{value:.3f}"
+        return f"{value:.4g}"
     return html.escape(str(value))
 
 

@@ -1,0 +1,13 @@
+<!DOCTYPE html><html><head><meta charset="utf-8"><title>teacher-forced comparison of Triton fp16 and fp8 fixed scale against plain HF fp16</title><style>
+body { font-family: system-ui, sans-serif; margin: 2rem; color: #222; }
+h1 { font-size: 1.3rem; }
+h2 { font-size: 1.05rem; margin-top: 2rem; }
+h3 { font-size: 0.95rem; margin-top: 1.2rem; }
+section { margin-top: 2.5rem; border-top: 2px solid #999; }
+h4 { font-size: 0.9rem; margin-top: 1rem; }
+.columns { display: flex; gap: 2rem; align-items: flex-start; }
+table { border-collapse: collapse; font-variant-numeric: tabular-nums; }
+th, td { border: 1px solid #ccc; padding: 0.25rem 0.6rem; text-align: right; }
+th { background: #f2f2f2; }
+td:first-child, th:first-child { text-align: left; }
+</style></head><body><h1>teacher-forced comparison of Triton fp16 and fp8 fixed scale against plain HF fp16</h1><table><thead><tr><th>setting</th><th>value</th></tr></thead><tbody><tr><td>benchmark</td><td>correctness</td></tr><tr><td>timestamp</td><td>2026-11-04T19:49:33</td></tr><tr><td>commit</td><td>d8d0e6d</td></tr><tr><td>dirty</td><td>False</td></tr><tr><td>torch</td><td>2.13.0+cu130</td></tr><tr><td>gpu</td><td>NVIDIA GeForce RTX 4070 Laptop GPU</td></tr><tr><td>reference</td><td>plain HF fp16</td></tr><tr><td>variants</td><td>[&#x27;triton_fp16&#x27;, &#x27;fp8&#x27;]</td></tr><tr><td>kinds</td><td>[&#x27;short&#x27;, &#x27;long&#x27;]</td></tr><tr><td>n_prompts</td><td>32</td></tr><tr><td>max_new_tokens</td><td>128</td></tr><tr><td>seed</td><td>0</td></tr><tr><td>fp8_calibration_s</td><td>43.807</td></tr></tbody></table><h2>Teacher-forced comparison against plain HF fp16</h2><table><thead><tr><th>variant</th><th>kind</th><th>prompts</th><th>positions</th><th>top-1 agreement</th><th>KL mean</th><th>KL p99</th><th>KL max</th><th>TV mean</th><th>TV p99</th><th>TV max</th><th>mean first difference</th><th>prompts with all positions agreeing</th></tr></thead><tbody><tr><td>triton_fp16</td><td>short</td><td>32</td><td>2880</td><td>0.999</td><td>0.000</td><td>0.000</td><td>0.000</td><td>0.001</td><td>0.005</td><td>0.007</td><td>83.562</td><td>30</td></tr><tr><td>triton_fp16</td><td>long</td><td>32</td><td>3274</td><td>0.999</td><td>0.000</td><td>0.000</td><td>0.000</td><td>0.001</td><td>0.006</td><td>0.012</td><td>99.094</td><td>30</td></tr><tr><td>fp8</td><td>short</td><td>32</td><td>2880</td><td>0.935</td><td>0.018</td><td>0.105</td><td>0.372</td><td>0.054</td><td>0.193</td><td>0.410</td><td>11.031</td><td>8</td></tr><tr><td>fp8</td><td>long</td><td>32</td><td>3274</td><td>0.947</td><td>0.018</td><td>0.119</td><td>0.379</td><td>0.052</td><td>0.217</td><td>0.396</td><td>20.312</td><td>3</td></tr></tbody></table></body></html>

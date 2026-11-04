@@ -12,20 +12,20 @@ from common import MODEL_ID
 from feature_bench.html_report import render_report
 from kv_cache.storage import KVStorage
 from quant.calibration import calibrate
-from quant.core import use_fp8
+from quant.core import ALL_PROJECTIONS, use_fp8
 
 
 PAGE_SIZE = 16
 KV_CAPACITY = 32768
 
 
-def load_model(fp8: bool = False):
+def load_model(fp8: bool = False, fp8_projections: frozenset[str] = ALL_PROJECTIONS):
     model = AutoModelForCausalLM.from_pretrained(
         MODEL_ID, dtype=torch.float16
     ).to("cuda").eval()
     model.calibration_seconds = None
     if fp8:
-        use_fp8(model)
+        use_fp8(model, fp8_projections)
         tokenizer = AutoTokenizer.from_pretrained(MODEL_ID)
         start = time.perf_counter()
         calibrate(model, tokenizer)
