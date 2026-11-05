@@ -7,36 +7,40 @@ from pathlib import Path
 
 import torch
 import torch.nn.functional as F
+import triton
 from transformers import AutoModelForCausalLM, AutoTokenizer, GenerationConfig
 
 from attn.core import merge_projections
+from attn.metadata import AttentionMetadata
 from benchmark.reference import load_references
 from benchmark.workload import build_workload
 from common import MODEL_ID
 from feature_bench.common import PAGE_SIZE, assign_pages, build_kv, load_model, save_report
 from quant.core import ALL_PROJECTIONS, Fp8Linear, FP8_MAX
+from scheduler.decode_module import DecodeModule
 from scheduler.mixed_module import MixedModule
-
 
 RESULTS_DIR = Path(__file__).resolve().parent / "results"
 KINDS = ["short", "long"]
 VARIANTS = {
-    "triton_fp16": frozenset(),
+    "fp16": frozenset(),
     "fp8_qkv": frozenset({"qkv"}),
     "fp8_o_proj": frozenset({"o_proj"}),
     "fp8_mlp": frozenset({"gate_proj", "up_proj", "down_proj"}),
     "fp8": ALL_PROJECTIONS,
 }
-SLOT = 1
+BATCH_SIZES = [1, 4]
+DECODE_SIZES = [1, 2, 4]
+PATHS = ["mixed", "decode"]
 FP8_MIN_NORMAL = 2 ** -6
 PROJECTIONS = ["qkv", "o_proj", "gate_proj", "up_proj", "down_proj"]
 
 
 class EagerMixedModule(MixedModule):
 
-    def __init__(self, model, kv_cache, token_count: int) -> None:
+    def __init__(self, model, kv_cache, batch_size: int, token_count: int) -> None:
         super().__init__(model, kv_cache, token_count)
-        self.metadata.prepare_full_graph(1)
+        self.metadata.prepare_full_graph(batch_size)
 
     def _pad(self, slot_ids: list[int]) -> list[int]:
         return slot_ids
@@ -46,7 +50,42 @@ class EagerMixedModule(MixedModule):
         self.metadata.write_slot_ids(slot_ids)
 
     def replay(self) -> torch.Tensor:
-        return self._forward()
+        hidden = self._forward()
+        self.kv_cache.mixed_advance(
+            slot_ids=self.metadata.slot_ids,
+            lens=self.lens
+        )
+
+        return hidden
+
+
+class EagerDecodeModule(DecodeModule):
+
+    def __init__(self, model, kv_cache, batch_size: int) -> None:
+        self.model = model
+        self.batch_size = batch_size
+        self.kv_cache = kv_cache
+
+        device = model.device
+        self.device = device
+
+        self.metadata = AttentionMetadata(
+            token_count=batch_size,
+            device=device,
+            full_decode=True
+        )
+        self.metadata.prepare_full_graph(batch_size)
+
+        with torch.inference_mode():
+            self.static_token = torch.zeros(
+                (1, batch_size), device=device, dtype=torch.long
+            )
+            self.static_position_ids = torch.zeros(
+                (1, batch_size), device=device, dtype=torch.long
+            )
+
+    def replay(self):
+        return self._forward().logits[0]
 
 
 def activation_hook(
@@ -171,19 +210,6 @@ def reference_logits(model, sequence: list[int], start: int) -> torch.Tensor:
     return model.lm_head(hidden[0, start:]).float()
 
 
-def engine_logits(model, kv, sequence: list[int], start: int) -> torch.Tensor:
-    assign_pages(
-        kv,
-        slot_ids=[SLOT],
-        pages_per_slot=math.ceil(len(sequence) / PAGE_SIZE),
-        context=0
-    )
-    module = EagerMixedModule(model, kv, token_count=len(sequence))
-    module.upload(prompts=[sequence], slot_ids=[SLOT])
-    hidden = module.replay()
-    return model.lm_head(hidden[0, start:]).float()
-
-
 def compare(reference: torch.Tensor, logits: torch.Tensor) -> dict[str, torch.Tensor]:
     log_p = F.log_softmax(reference, dim=-1)
     log_q = F.log_softmax(logits, dim=-1)
@@ -197,12 +223,67 @@ def compare(reference: torch.Tensor, logits: torch.Tensor) -> dict[str, torch.Te
     }
 
 
+def run_batch(
+        model,
+        reference_model,
+        kv,
+        decode_modules: dict[int, EagerDecodeModule],
+        requests: list,
+        comparisons: dict[str, list]
+) -> None:
+    slot_ids = list(range(1, len(requests) + 1))
+    assign_pages(
+        kv,
+        slot_ids=slot_ids,
+        pages_per_slot=math.ceil(max(len(p) + len(t) for p, t in requests) / PAGE_SIZE)
+    )
+
+    splits = [len(new_tokens) // 2 for _, new_tokens in requests]
+    chunks = [prompt + new_tokens[:split] for (prompt, new_tokens), split in zip(requests, splits)]
+    decode_inputs = [new_tokens[split:-1] for (_, new_tokens), split in zip(requests, splits)]
+    references = [
+        reference_logits(reference_model, prompt + new_tokens[:-1], len(prompt) - 1)
+        for prompt, new_tokens in requests
+    ]
+
+    mixed = EagerMixedModule(
+        model, kv, batch_size=len(requests), token_count=sum(map(len, chunks))
+    )
+    mixed.upload(prompts=chunks, slot_ids=slot_ids)
+    hidden = mixed.replay()
+
+    offset = 0
+    for (prompt, _), chunk, split, reference in zip(requests, chunks, splits, references):
+        logits = model.lm_head(hidden[0, offset + len(prompt) - 1:offset + len(chunk)]).float()
+        comparisons["mixed"].append(compare(reference[:split + 1], logits))
+        offset += len(chunk)
+
+    decode_logits = [[] for _ in requests]
+    for step in range(max(map(len, decode_inputs))):
+        active = [i for i, tokens in enumerate(decode_inputs) if step < len(tokens)]
+        active_slots = [slot_ids[i] for i in active]
+
+        kv.last_generated[active_slots] = torch.tensor(
+            [decode_inputs[i][step] for i in active], device=kv.device
+        )
+        module = decode_modules[triton.next_power_of_2(len(active))]
+        module.upload(active_slots)
+        logits = module.replay()
+
+        for row, i in enumerate(active):
+            decode_logits[i].append(logits[row].float())
+
+    for logits, split, reference in zip(decode_logits, splits, references):
+        if logits:
+            comparisons["decode"].append(compare(reference[split + 1:], torch.stack(logits)))
+
+
 def first_difference(top1: torch.Tensor) -> int:
     differences = (~top1).nonzero()
     return len(top1) if len(differences) == 0 else differences[0].item()
 
 
-def summary_row(variant: str, kind: str, results: list[dict[str, torch.Tensor]]) -> list:
+def summary_row(variant: str, kind: str, batch_size: int, path: str, results: list[dict[str, torch.Tensor]]) -> list:
     top1 = torch.cat([r["top1"] for r in results]).float()
     kl = torch.cat([r["kl"] for r in results])
     tv = torch.cat([r["tv"] for r in results])
@@ -210,7 +291,7 @@ def summary_row(variant: str, kind: str, results: list[dict[str, torch.Tensor]])
     exact = sum(bool(r["top1"].all()) for r in results)
 
     return [
-        variant, kind, len(results), len(top1),
+        variant, kind, batch_size, path, len(results), len(top1),
         top1.mean().item(),
         kl.mean().item(), kl.quantile(0.99).item(), kl.max().item(),
         tv.mean().item(), tv.quantile(0.99).item(), tv.max().item(),
@@ -279,17 +360,26 @@ def run_variant(
     weights = collections.defaultdict(dict)
     attach_hooks(model, reference_model, results=activations, weight_stats=weights)
 
-    kv = build_kv(model, n_slots=SLOT + 1)
+    kv = build_kv(model, n_slots=max(BATCH_SIZES) + 1)
+    decode_modules = {size: EagerDecodeModule(model, kv, batch_size=size) for size in DECODE_SIZES}
 
-    comparisons = {kind: [] for kind in workloads}
+    comparisons = {
+        (kind, batch_size): {path: [] for path in PATHS}
+        for kind in workloads
+        for batch_size in BATCH_SIZES
+    }
     with torch.inference_mode():
         for kind, requests in workloads.items():
-            for prompt, new_tokens in requests:
-                sequence = prompt + new_tokens[:-1]
-                start = len(prompt) - 1
-                reference = reference_logits(reference_model, sequence, start)
-                logits = engine_logits(model, kv, sequence, start)
-                comparisons[kind].append(compare(reference, logits))
+            for batch_size in BATCH_SIZES:
+                for start in range(0, len(requests), batch_size):
+                    run_batch(
+                        model,
+                        reference_model,
+                        kv,
+                        decode_modules,
+                        requests[start:start + batch_size],
+                        comparisons[(kind, batch_size)]
+                    )
 
     result = {
         "comparisons": comparisons,
@@ -298,7 +388,7 @@ def run_variant(
         "calibration_seconds": model.calibration_seconds,
     }
 
-    del model, kv
+    del model, kv, decode_modules
     gc.collect()
     torch.cuda.empty_cache()
 
@@ -338,9 +428,11 @@ def main() -> None:
     }
 
     rows = [
-        summary_row(variant, kind, results[variant]["comparisons"][kind])
+        summary_row(variant, kind, batch_size, path, results[variant]["comparisons"][(kind, batch_size)][path])
         for variant in VARIANTS
         for kind in KINDS
+        for batch_size in BATCH_SIZES
+        for path in PATHS
     ]
 
     fp8_variants = [variant for variant, projections in VARIANTS.items() if projections]
@@ -349,9 +441,12 @@ def main() -> None:
         name="correctness",
         title=args.title,
         settings={
-            "reference": "plain HF fp16",
+            "reference": "raw HF fp16",
             "variants": {variant: sorted(projections) for variant, projections in VARIANTS.items()},
             "kinds": KINDS,
+            "batch_sizes": BATCH_SIZES,
+            "decode_sizes": DECODE_SIZES,
+            "split": "mixed compares up to and including the first token after len(new_tokens) // 2, decode the rest",
             "n_prompts": args.n_prompts,
             "max_new_tokens": args.max_new_tokens,
             "seed": args.seed,
@@ -361,11 +456,11 @@ def main() -> None:
         },
         tables=[
             {
-                "title": "Teacher-forced comparison against plain HF fp16",
+                "title": "Teacher-forced comparison against reference",
                 "columns": [
-                    "variant", "kind", "prompts", "positions", "top-1 agreement",
+                    "variant", "kind", "B", "path", "sequences", "positions", "top-1 agreement",
                     "KL mean", "KL p99", "KL max", "TV mean", "TV p99", "TV max",
-                    "mean first difference", "prompts with all positions agreeing",
+                    "mean first difference", "sequences with all positions agreeing",
                 ],
                 "rows": rows,
             },
