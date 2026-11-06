@@ -11,7 +11,9 @@ import torch
 import torch.nn.functional as F
 from torch.profiler import ProfilerActivity, profile
 
-from feature_bench.common import load_model, save_report
+from common import MODEL_ID
+from feature_bench.common import save_report
+from model_loader import build_model
 
 
 RESULTS_DIR = Path(__file__).resolve().parent / "results"
@@ -68,7 +70,7 @@ def build_modules(token_count: int) -> dict[str, GemmModule]:
     torch._dynamo.config.recompile_limit = 256
     torch.manual_seed(0)
 
-    model = load_model()
+    model = build_model(MODEL_ID, torch.float16)
     return {
         name: GemmModule(weight=weight, bias=bias, token_count=token_count)
         for name, (weight, bias) in first_layer_projections(model).items()

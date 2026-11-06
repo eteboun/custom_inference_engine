@@ -155,7 +155,9 @@ Main arguments: `--title` (required), `--engines` (`ours vllm`), `--kinds` (`sho
 `--rates` (`4 8 inf` requests/s), `--repeats` (3), `--n-requests` (500), `--trim` (0.05),
 `--warmup-requests` (16), `--max-new-tokens` (128), `--n-slots` (33), `--page-size` (16),
 `--token-budget` (1024). vLLM gets `max_num_seqs = n_slots - 1` and
-`max_num_batched_tokens = token_budget`.
+`max_num_batched_tokens = token_budget`. `--engines` also accepts `ours-fp8` (fp8 projections with
+calibrated input scales, see fp8 projections below) and `vllm-fp8` (vLLM with
+`quantization="fp8_per_tensor"`).
 
 `n_slots` can be at most one more than the largest bucket (32); slot 0 is the padding slot,
 so at most 32 requests run at once. `token_budget` must be above 128 and a multiple of 32.
@@ -396,12 +398,12 @@ and are marked as dirty.
 
 ### fp8 projections
 
-`load_model` loads the plain HF model and merges Q/K/V into one projection (`merge_qkv`, which
-drops the separate `q_proj`, `k_proj` and `v_proj`). With `fp8=True` it then replaces the merged
-Q/K/V, `o_proj`, `gate_proj`, `up_proj` and `down_proj` with `Fp8Linear`. The largest input of
-each projection is recorded while generating from 16 calibration prompts that are separate from
-the benchmark prompts (`quant/calibration.py`). Input scales are that value / 448, times 1.1, and
-stay fixed afterwards. `lm_head`, attention and KV stay fp16.
+`build_model` (`model_loader.py`) loads the plain HF model and merges Q/K/V into one projection
+(`merge_qkv`, which drops the separate `q_proj`, `k_proj` and `v_proj`). With `quantization="fp8"`
+it then replaces the merged Q/K/V, `o_proj`, `gate_proj`, `up_proj` and `down_proj` with
+`Fp8Linear`. The largest input of each projection is recorded while generating from 16 calibration
+prompts that are separate from the benchmark prompts (`quant/calibration.py`). Input scales are
+that value / 448, times 1.1, and stay fixed afterwards. `lm_head`, attention and KV stay fp16.
 
 Decode forward at each batch bucket (`decode_kernels`, KV context of 256 tokens), per replay in
 ms, `fp16 | fp8`. `matmul, 24+ calls` are the kernels called at least 24 times per replay:

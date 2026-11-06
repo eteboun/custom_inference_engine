@@ -15,7 +15,8 @@ from attn.metadata import AttentionMetadata
 from benchmark.reference import load_references
 from benchmark.workload import build_workload
 from common import MODEL_ID
-from feature_bench.common import PAGE_SIZE, assign_pages, build_kv, load_model, save_report
+from feature_bench.common import PAGE_SIZE, assign_pages, build_kv, save_report
+from model_loader import build_model
 from quant.core import ALL_PROJECTIONS, Fp8Linear, FP8_MAX
 from scheduler.decode_module import DecodeModule
 from scheduler.mixed_module import MixedModule
@@ -354,7 +355,11 @@ def run_variant(
         reference_model,
         workloads: dict[str, list]
 ) -> dict:
-    model = load_model(fp8=bool(projections), fp8_projections=projections)
+    model = build_model(
+        MODEL_ID, torch.float16,
+        quantization="fp8" if projections else None,
+        fp8_projections=projections
+    )
 
     activations = collections.defaultdict(lambda: collections.defaultdict(list))
     weights = collections.defaultdict(dict)

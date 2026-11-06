@@ -5,8 +5,7 @@ from concurrent.futures import Future, InvalidStateError
 
 import torch
 from typing import ClassVar
-from transformers import AutoModelForCausalLM
-from attn.core import use_triton_attention
+from model_loader import build_model
 from scheduler.models import ComponentInitStats, Request, RequestResult, Tracker
 from kv_cache.storage import KVStorage
 from scheduler.graph_backend import FullGraphBackend, PiecewiseGraphBackend
@@ -30,7 +29,8 @@ class Scheduler:
             n_slots: int,
             page_size: int,
             token_budget: int,
-            dtype: torch.dtype
+            dtype: torch.dtype,
+            quantization: str | None = None
     ) -> None:
 
         init_start = time.perf_counter()
@@ -74,19 +74,9 @@ class Scheduler:
 
         start = time.perf_counter()
         allocated_before = torch.cuda.memory_allocated()
-        model = AutoModelForCausalLM.from_pretrained(
-            model_id, dtype=dtype
-        ).to("cuda").eval()
+        model = build_model(model_id, dtype, quantization)
         self.tracker.init.model = self._init_stats(start, allocated_before)
-
-        try:
-            use_triton_attention(model)
-
-        except Exception as exc:
-            raise RuntimeError(
-                "Failed to switch triton attention:"
-                f" {exc}"
-            )
+        self.tracker.init.calibration_seconds = model.calibration_seconds
 
         self.model = model
         self.max_new_tokens = max_new_tokens

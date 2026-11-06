@@ -8,7 +8,9 @@ from pathlib import Path
 import torch
 import torch.nn.functional as F
 
-from feature_bench.common import load_model, save_report
+from common import MODEL_ID
+from feature_bench.common import save_report
+from model_loader import build_model
 from feature_bench.token_threshold.gemm_token_steps import first_layer_projections, measure_replay, profile_kernels
 from quant.core import get_scale, quantize
 
@@ -93,7 +95,7 @@ def build_modules(token_count: int) -> dict[tuple[str, str], ProjectionModule]:
     torch._dynamo.config.recompile_limit = 256
     torch.manual_seed(0)
 
-    model = load_model()
+    model = build_model(MODEL_ID, torch.float16)
     return {
         (name, variant): ProjectionModule(
             variant=variant,

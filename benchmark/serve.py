@@ -23,7 +23,7 @@ class Server(Protocol):
 
 class OursServer:
 
-    def __init__(self, args: argparse.Namespace, eos_token_ids: set[int]) -> None:
+    def __init__(self, args: argparse.Namespace, eos_token_ids: set[int], quantization: str | None) -> None:
         self.engine = Scheduler(
             model_id=MODEL_ID,
             eos_token_ids=eos_token_ids,
@@ -31,7 +31,8 @@ class OursServer:
             n_slots=args.n_slots,
             page_size=args.page_size,
             token_budget=args.token_budget,
-            dtype=torch.float16
+            dtype=torch.float16,
+            quantization=quantization
         )
         self.thread = threading.Thread(target=self.engine.loop, daemon=True)
         self.thread.start()
@@ -60,13 +61,14 @@ class OursServer:
 
 class VllmServer:
 
-    def __init__(self, args: argparse.Namespace, eos_token_ids: set[int]) -> None:
+    def __init__(self, args: argparse.Namespace, eos_token_ids: set[int], quantization: str | None) -> None:
         from vllm_baseline.vllm_generate import build_vllm_engine
 
         start = time.perf_counter()
         self.engine = build_vllm_engine(
             max_num_seqs=args.n_slots - 1,
-            max_num_batched_tokens=args.token_budget
+            max_num_batched_tokens=args.token_budget,
+            quantization=quantization
         )
         self.init = InitStats(total_seconds=time.perf_counter() - start)
 

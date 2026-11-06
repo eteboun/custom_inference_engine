@@ -5,7 +5,9 @@ from pathlib import Path
 import torch
 import torch._dynamo.utils as dynamo_utils
 
-from feature_bench.common import assign_pages, build_kv, load_model, save_report
+from common import MODEL_ID
+from feature_bench.common import assign_pages, build_kv, save_report
+from model_loader import build_model
 from scheduler.graph_backend import PiecewiseGraphBackend
 from scheduler.mixed_module import FullMixedModule
 
@@ -55,7 +57,7 @@ def main():
 
     torch._dynamo.config.recompile_limit = 64
 
-    model = load_model()
+    model = build_model(MODEL_ID, torch.float16)
     kv = build_kv(model, N_SLOTS)
     pool = torch.cuda.graph_pool_handle()
 

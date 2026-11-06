@@ -11,7 +11,9 @@ from pathlib import Path
 import torch
 from torch.profiler import ProfilerActivity, profile
 
-from feature_bench.common import assign_pages, build_kv, load_model, save_report
+from common import MODEL_ID
+from feature_bench.common import assign_pages, build_kv, save_report
+from model_loader import build_model
 from feature_bench.token_threshold.gemm_token_steps import read_trace_events
 from scheduler.decode_module import DecodeModule
 
@@ -139,7 +141,7 @@ def run_worker(variant: str, worker_out: Path) -> None:
     torch._dynamo.config.recompile_limit = 256
     torch.manual_seed(0)
 
-    model = load_model(fp8=variant == "fp8")
+    model = build_model(MODEL_ID, torch.float16, quantization="fp8" if variant == "fp8" else None)
     kv = build_kv(model, n_slots=max(BATCH_SIZES) + 1)
     pool = torch.cuda.graph_pool_handle()
 

@@ -40,6 +40,7 @@ class ComponentInitStats:
 @dataclass
 class InitStats:
     total_seconds: float = 0.0
+    calibration_seconds: float | None = None
     model: ComponentInitStats | None = None
     kv_cache: ComponentInitStats | None = None
     piecewise: ComponentInitStats | None = None

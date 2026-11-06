@@ -9,7 +9,9 @@ from pathlib import Path
 import torch
 from torch.profiler import ProfilerActivity, profile
 
-from feature_bench.common import assign_pages, build_kv, load_model, save_report
+from common import MODEL_ID
+from feature_bench.common import assign_pages, build_kv, save_report
+from model_loader import build_model
 from feature_bench.token_threshold.step_time import WARMUP_REPLAYS, timed
 from kv_cache.storage import KVStorage
 from scheduler.mixed_module import FullMixedModule
@@ -28,7 +30,7 @@ PROFILE_ITERS = 20
 def build_modules(token_count: int) -> tuple[KVStorage, dict[int, FullMixedModule]]:
     torch._dynamo.config.recompile_limit = 256
 
-    model = load_model()
+    model = build_model(MODEL_ID, torch.float16)
     kv = build_kv(model, n_slots=max(BATCH_SIZES) + 1)
     pool = torch.cuda.graph_pool_handle()
 

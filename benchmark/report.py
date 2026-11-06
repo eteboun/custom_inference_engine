@@ -49,7 +49,7 @@ def environment(engine: str) -> dict[str, str | None]:
         "torch": torch.__version__,
         "gpu": torch.cuda.get_device_name() if torch.cuda.is_available() else None,
     }
-    if engine == "vllm":
+    if engine.startswith("vllm"):
         import vllm
         env["vllm"] = vllm.__version__
     return env
@@ -108,6 +108,8 @@ def init_table(init: InitStats) -> dict:
         ]
 
     rows = [["total", init.total_seconds, None, None, None]]
+    if init.calibration_seconds is not None:
+        rows.append(["calibration", init.calibration_seconds, None, None, None])
     for field in dataclasses.fields(InitStats):
         stats = getattr(init, field.name)
         if isinstance(stats, ComponentInitStats):

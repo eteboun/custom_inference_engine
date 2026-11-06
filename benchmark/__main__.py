@@ -15,6 +15,9 @@ from benchmark.serve import OursServer, Server, VllmServer
 from benchmark.workload import WorkloadInfo, build_workload, poisson_arrivals
 from common import MODEL_ID
 
+ENGINES = ["ours", "ours-fp8", "vllm", "vllm-fp8"]
+QUANTIZATION = {"ours-fp8": "fp8", "vllm-fp8": "fp8_per_tensor"}
+
 
 def load_eos_token_ids(tokenizer) -> set[int]:
     eos = GenerationConfig.from_pretrained(MODEL_ID).eos_token_id
@@ -28,7 +31,7 @@ def load_eos_token_ids(tokenizer) -> set[int]:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--title", required=True)
-    parser.add_argument("--engines", nargs="+", choices=["ours", "vllm"], default=["ours", "vllm"])
+    parser.add_argument("--engines", nargs="+", choices=ENGINES, default=["ours", "vllm"])
     parser.add_argument("--kinds", nargs="+", choices=["short", "long", "mixed"], default=["short", "long", "mixed"])
     parser.add_argument("--rates", type=float, nargs="+", default=[4.0, 8.0, float("inf")])
     parser.add_argument("--repeats", type=int, default=3)
@@ -40,7 +43,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--n-slots", type=int, default=33)
     parser.add_argument("--page-size", type=int, default=16)
     parser.add_argument("--token-budget", type=int, default=1024)
-    parser.add_argument("--worker-engine", choices=["ours", "vllm"], default=None)
+    parser.add_argument("--worker-engine", choices=ENGINES, default=None)
     parser.add_argument("--run-dir", type=Path, default=None)
     return parser.parse_args()
 
@@ -67,10 +70,11 @@ def run_engine(args: argparse.Namespace) -> None:
         )
         workloads[kind] = requests, info, references
 
+    quantization = QUANTIZATION.get(engine)
     server: Server = (
-        OursServer(args, eos_token_ids)
-        if engine == "ours"
-        else VllmServer(args, eos_token_ids)
+        OursServer(args, eos_token_ids, quantization)
+        if engine.startswith("ours")
+        else VllmServer(args, eos_token_ids, quantization)
     )
 
     warmup_requests, _ = build_workload(
@@ -91,6 +95,7 @@ def run_engine(args: argparse.Namespace) -> None:
         "page_size": args.page_size,
         "token_budget": args.token_budget,
         "prompt_seed": args.seed,
+        "quantization": quantization,
     }
 
     configs = list(itertools.product(range(args.repeats), args.kinds, args.rates))
