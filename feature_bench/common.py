@@ -34,7 +34,10 @@ def assign_pages(kv: KVStorage, slot_ids: list[int], pages_per_slot: int, contex
         kv.lens[slot] = context
 
 
-def save_report(name: str, title: str, settings: dict, tables: list[dict], results_dir: Path) -> Path:
+def save_report(
+        name: str, title: str, settings: dict, tables: list[dict], results_dir: Path,
+        records: list | None = None
+) -> Path:
     results_dir.mkdir(parents=True, exist_ok=True)
     now = datetime.now()
     path = results_dir / f"{now:%Y%m%d-%H%M%S}_{name}.json"
@@ -47,6 +50,8 @@ def save_report(name: str, title: str, settings: dict, tables: list[dict], resul
         "settings": settings,
         "tables": tables,
     }
+    if records is not None:
+        report["records"] = records
     with open(path, "w") as f:
         json.dump(report, f)
 

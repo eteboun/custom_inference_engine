@@ -94,7 +94,8 @@ def run_worker(variant: str, args: argparse.Namespace) -> None:
     answers = []
     for question, result in zip(questions, results):
         tokens = result.new_tokens
-        prediction = extract_answer(tokenizer.decode(tokens, skip_special_tokens=True))
+        text = tokenizer.decode(tokens, skip_special_tokens=True)
+        prediction = extract_answer(text)
         reference = reference_answer(question["answer"])
         answers.append({
             "reference": reference,
@@ -102,6 +103,7 @@ def run_worker(variant: str, args: argparse.Namespace) -> None:
             "correct": prediction is not None and math.isclose(prediction, reference, abs_tol=1e-6),
             "tokens": len(tokens),
             "truncated": tokens[-1] not in eos_token_ids,
+            "text": text,
         })
 
     with open(args.worker_out, "a") as f:
@@ -115,6 +117,7 @@ def run_worker(variant: str, args: argparse.Namespace) -> None:
                 if (stats := getattr(engine.tracker.init, name)) is not None
             },
             "generation_seconds": seconds,
+            "preemptions": engine.tracker.run.preemptions,
             "answers": answers,
         }) + "\n")
 
@@ -136,11 +139,26 @@ def accuracy_row(run: dict) -> list:
         sum(a["correct"] for a in answers) / len(answers),
         sum(a["prediction"] is None for a in answers),
         sum(a["truncated"] for a in answers),
+        sum(a["truncated"] and a["correct"] for a in answers),
         tokens / len(answers),
         run["generation_seconds"],
         tokens / run["generation_seconds"],
         run["init_seconds"],
         run["calibration_seconds"],
+        run["preemptions"],
+    ]
+
+
+def paired_row(name: str, pairs: list[tuple[dict, dict]]) -> list:
+    fp16_only = sum(a["correct"] and not b["correct"] for a, b in pairs)
+    fp8_only = sum(b["correct"] and not a["correct"] for a, b in pairs)
+    return [
+        name, len(pairs),
+        sum(a["correct"] and b["correct"] for a, b in pairs),
+        fp16_only,
+        fp8_only,
+        sum(not a["correct"] and not b["correct"] for a, b in pairs),
+        mcnemar_p(fp16_only, fp8_only),
     ]
 
 
@@ -148,16 +166,16 @@ def build_tables(runs: dict[str, dict]) -> list[dict]:
     fp16 = runs["fp16"]["answers"]
     fp8 = runs["fp8"]["answers"]
     pairs = list(zip(fp16, fp8))
-    fp16_only = sum(a["correct"] and not b["correct"] for a, b in pairs)
-    fp8_only = sum(b["correct"] and not a["correct"] for a, b in pairs)
+    complete = [(a, b) for a, b in pairs if not a["truncated"] and not b["truncated"]]
 
     return [
         {
             "title": "Accuracy",
             "columns": [
                 "variant", "questions", "correct", "accuracy", "no answer found",
-                "hit max_new_tokens", "mean generated tokens", "generation seconds",
-                "generated tokens/s", "scheduler init seconds", "calibration seconds",
+                "hit max_new_tokens", "correct among hit max_new_tokens", "mean generated tokens",
+                "generation seconds", "generated tokens/s", "scheduler init seconds",
+                "calibration seconds", "preemptions",
             ],
             "rows": [accuracy_row(runs[variant]) for variant in VARIANTS],
         },
@@ -181,23 +199,26 @@ def build_tables(runs: dict[str, dict]) -> list[dict]:
         },
         {
             "title": "Paired by question",
-            "columns": ["both correct", "fp16 only", "fp8 only", "both wrong", "McNemar exact p"],
-            "rows": [[
-                sum(a["correct"] and b["correct"] for a, b in pairs),
-                fp16_only,
-                fp8_only,
-                sum(not a["correct"] and not b["correct"] for a, b in pairs),
-                mcnemar_p(fp16_only, fp8_only),
-            ]],
+            "columns": [
+                "questions", "count", "both correct", "fp16 only", "fp8 only", "both wrong",
+                "McNemar exact p",
+            ],
+            "rows": [
+                paired_row("all", pairs),
+                paired_row("neither hit max_new_tokens", complete),
+            ],
         },
         {
             "title": "Questions where only one variant is correct",
             "columns": [
                 "index", "reference", "fp16 prediction", "fp8 prediction",
-                "fp16 tokens", "fp8 tokens",
+                "fp16 tokens", "fp8 tokens", "fp16 hit max_new_tokens", "fp8 hit max_new_tokens",
             ],
             "rows": [
-                [i, a["reference"], a["prediction"], b["prediction"], a["tokens"], b["tokens"]]
+                [
+                    i, a["reference"], a["prediction"], b["prediction"], a["tokens"], b["tokens"],
+                    a["truncated"], b["truncated"],
+                ]
                 for i, (a, b) in enumerate(pairs)
                 if a["correct"] != b["correct"]
             ],
@@ -209,7 +230,7 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--title", default=None)
     parser.add_argument("--limit", type=int, default=None)
-    parser.add_argument("--max-new-tokens", type=int, default=512)
+    parser.add_argument("--max-new-tokens", type=int, default=1024)
     parser.add_argument("--n-slots", type=int, default=33)
     parser.add_argument("--token-budget", type=int, default=1024)
     parser.add_argument("--results-dir", type=Path, default=RESULTS_DIR)
@@ -264,7 +285,16 @@ def main() -> None:
             "page_size": PAGE_SIZE,
         },
         tables=build_tables(runs),
-        results_dir=args.results_dir
+        results_dir=args.results_dir,
+        records=[
+            {
+                "index": i,
+                "question": question["question"],
+                "reference": question["answer"],
+                **{variant: runs[variant]["answers"][i] for variant in VARIANTS},
+            }
+            for i, question in enumerate(load_questions(args.limit))
+        ]
     )
     print(f"saved: {path}")
 
