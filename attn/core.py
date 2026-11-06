@@ -2,7 +2,10 @@ import torch
 from torch.library import triton_op, wrap_triton
 import triton
 
-from transformers.models.qwen2.modeling_qwen2 import Qwen2Attention, apply_rotary_pos_emb
+from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
+from transformers.models.qwen2.modeling_qwen2 import (
+    Qwen2Attention, apply_rotary_pos_emb, eager_attention_forward
+)
 
 from kernels.decode_attention import (
     decode_gqa_attention_kernel_load, decode_attention_kernel_merge
@@ -148,28 +151,81 @@ def merge_projections(projs: list[torch.nn.Linear]) -> torch.nn.Linear:
     return merged
 
 
-class TritonQwen2Attention(torch.nn.Module):
-    def __init__(self, original_attn):
-        super().__init__()
+class MergedQwen2Attention(Qwen2Attention):
 
-        assert original_attn.sliding_window is None, "sliding window desteklenmiyor"
-        self.original = original_attn
-        self.layer_idx = original_attn.layer_idx
-        self.num_heads = original_attn.config.num_attention_heads
-        self.head_dim = original_attn.head_dim
-        assert original_attn.scaling == self.head_dim ** -0.5
+    def __init__(self, original: Qwen2Attention) -> None:
+        with torch.device("meta"):
+            super().__init__(original.config, original.layer_idx)
+        self.eval()
 
-        projs = [original_attn.q_proj, original_attn.k_proj, original_attn.v_proj]
-        assert all(p.bias is not None for p in projs)
-        self.qkv_sizes = [p.out_features for p in projs]
-        self.qkv = getattr(original_attn, "qkv_fp8", None)
-        if self.qkv is None:
+        if isinstance(original, MergedQwen2Attention):
+            self.qkv = original.qkv
+            self.qkv_sizes = original.qkv_sizes
+        else:
+            projs = [original.q_proj, original.k_proj, original.v_proj]
+            assert all(p.bias is not None for p in projs)
             self.qkv = merge_projections(projs)
+            self.qkv_sizes = [p.out_features for p in projs]
+        self.o_proj = original.o_proj
+        del self.q_proj, self.k_proj, self.v_proj
+
+    def forward(self, hidden_states, position_embeddings, attention_mask,
+                past_key_values=None, **kwargs):
+        input_shape = hidden_states.shape[:-1]
+        hidden_shape = (*input_shape, -1, self.head_dim)
+
+        q, k, v = self.qkv(hidden_states).split(self.qkv_sizes, dim=-1)
+        query_states = q.view(hidden_shape).transpose(1, 2)
+        key_states = k.view(hidden_shape).transpose(1, 2)
+        value_states = v.view(hidden_shape).transpose(1, 2)
+
+        cos, sin = position_embeddings
+        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
+
+        if past_key_values is not None:
+            key_states, value_states = past_key_values.update(key_states, value_states, self.layer_idx)
+
+        attention_interface = ALL_ATTENTION_FUNCTIONS.get_interface(
+            self.config._attn_implementation, eager_attention_forward
+        )
+
+        attn_output, attn_weights = attention_interface(
+            self,
+            query_states,
+            key_states,
+            value_states,
+            attention_mask,
+            dropout=0.0 if not self.training else self.attention_dropout,
+            scaling=self.scaling,
+            sliding_window=self.sliding_window,
+            **kwargs,
+        )
+
+        attn_output = attn_output.reshape(*input_shape, -1).contiguous()
+        attn_output = self.o_proj(attn_output)
+        return attn_output, attn_weights
+
+
+def merge_qkv(module) -> None:
+    for name, child in module.named_children():
+        if type(child) is Qwen2Attention:
+            setattr(module, name, MergedQwen2Attention(child))
+        else:
+            merge_qkv(child)
+
+
+class TritonQwen2Attention(MergedQwen2Attention):
+
+    def __init__(self, original: Qwen2Attention) -> None:
+        super().__init__(original)
+        assert self.sliding_window is None, "sliding window desteklenmiyor"
+        assert self.scaling == self.head_dim ** -0.5
+        self.num_heads = self.config.num_attention_heads
 
     def forward(self, hidden_states, position_embeddings, attention_mask=None,
                 past_key_values=None, kv_manager=None, **kwargs):
         if kv_manager is None:
-            return self.original(
+            return super().forward(
                 hidden_states, position_embeddings, attention_mask,
                 past_key_values=past_key_values, **kwargs
             )
@@ -180,7 +236,6 @@ class TritonQwen2Attention(torch.nn.Module):
                 "'metadata' is required with custom kv_manager."
             )
 
-        attn = self.original
         total_T = hidden_states.shape[1]
         hidden_shape = (1, total_T, -1, self.head_dim)
         q, k, v = self.qkv(hidden_states).split(self.qkv_sizes, dim=-1)
@@ -232,15 +287,15 @@ class TritonQwen2Attention(torch.nn.Module):
                 slot_ids=metadata.slot_ids, block_table=kv_manager.block_table
             )
 
-        attn_output = attn.o_proj(o.reshape(1, total_T, self.num_heads * self.head_dim))
+        attn_output = self.o_proj(o.reshape(1, total_T, self.num_heads * self.head_dim))
         return attn_output, None
 
 
 def replace_attention(module):
     for name, child in module.named_children():
-        if isinstance(child, Qwen2Attention):
+        if type(child) in (Qwen2Attention, MergedQwen2Attention):
             setattr(module, name, TritonQwen2Attention(child))
-        elif not isinstance(child, TritonQwen2Attention):
+        else:
             replace_attention(child)
 
 

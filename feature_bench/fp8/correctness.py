@@ -149,15 +149,15 @@ def attach_hooks(
             fp8attn = fp8layer.self_attn
             fp16attn = fp16layer.self_attn
 
-            if isinstance(fp8attn.original.o_proj, Fp8Linear):
-                fp8attn.original.o_proj.register_forward_hook(
+            if isinstance(fp8attn.o_proj, Fp8Linear):
+                fp8attn.o_proj.register_forward_hook(
                     partial(activation_hook, weight=fp16attn.o_proj.weight, bias=fp16attn.o_proj.bias,
                             name="o_proj", results=results, layer_idx=layer_idx)
                 )
 
                 set_weight_stats(
-                    fp8weight=fp8attn.original.o_proj.w,
-                    fp8scale=fp8attn.original.o_proj.sw,
+                    fp8weight=fp8attn.o_proj.w,
+                    fp8scale=fp8attn.o_proj.sw,
                     fp16weight=fp16attn.o_proj.weight,
                     weight_stats=weight_stats,
                     name="o_proj",

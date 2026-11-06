@@ -396,8 +396,9 @@ and are marked as dirty.
 
 ### fp8 projections
 
-`load_model(fp8=True)` loads the plain HF model and replaces `o_proj`, `gate_proj`, `up_proj` and
-`down_proj` with `Fp8Linear`, and builds one for the merged Q/K/V projection. The largest input of
+`load_model` loads the plain HF model and merges Q/K/V into one projection (`merge_qkv`, which
+drops the separate `q_proj`, `k_proj` and `v_proj`). With `fp8=True` it then replaces the merged
+Q/K/V, `o_proj`, `gate_proj`, `up_proj` and `down_proj` with `Fp8Linear`. The largest input of
 each projection is recorded while generating from 16 calibration prompts that are separate from
 the benchmark prompts (`quant/calibration.py`). Input scales are that value / 448, times 1.1, and
 stay fixed afterwards. `lm_head`, attention and KV stay fp16.

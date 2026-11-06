@@ -6,7 +6,7 @@ from pathlib import Path
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-from attn.core import use_triton_attention
+from attn.core import merge_qkv, use_triton_attention
 from benchmark.report import environment, git_state
 from common import MODEL_ID
 from feature_bench.html_report import render_report
@@ -24,6 +24,7 @@ def load_model(fp8: bool = False, fp8_projections: frozenset[str] = ALL_PROJECTI
         MODEL_ID, dtype=torch.float16
     ).to("cuda").eval()
     model.calibration_seconds = None
+    merge_qkv(model)
     if fp8:
         use_fp8(model, fp8_projections)
         tokenizer = AutoTokenizer.from_pretrained(MODEL_ID)

@@ -1,6 +1,6 @@
 import torch
 
-from attn.core import merge_projections
+from attn.core import MergedQwen2Attention
 
 
 FP8_MAX = 448
@@ -59,17 +59,13 @@ class Fp8Linear(torch.nn.Module):
 def use_fp8(model, projections: frozenset[str] = ALL_PROJECTIONS) -> None:
     for layer in model.model.layers:
         attention = layer.self_attn
+        assert isinstance(attention, MergedQwen2Attention), "use_fp8 needs merge_qkv first"
 
         if "o_proj" in projections:
             attention.o_proj = Fp8Linear(attention.o_proj.weight, attention.o_proj.bias)
 
         if "qkv" in projections:
-            merged = merge_projections([attention.q_proj, attention.k_proj, attention.v_proj])
-            qkv_fp8 = Fp8Linear(merged.weight, merged.bias)
-            attention.qkv_fp8 = qkv_fp8
-            attention.q_proj.register_forward_pre_hook(
-                lambda _, args, qkv_fp8=qkv_fp8: qkv_fp8.observe(args[0])
-            )
+            attention.qkv = Fp8Linear(attention.qkv.weight, attention.qkv.bias)
 
         mlp = layer.mlp
         for name in ("gate_proj", "up_proj", "down_proj"):

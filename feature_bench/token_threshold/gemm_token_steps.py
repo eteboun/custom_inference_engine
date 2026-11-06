@@ -57,7 +57,7 @@ def first_layer_projections(model) -> dict[str, tuple[torch.Tensor, torch.Tensor
 
     return {
         "qkv": (attention.qkv.weight, attention.qkv.bias),
-        "o_proj": (attention.original.o_proj.weight, attention.original.o_proj.bias),
+        "o_proj": (attention.o_proj.weight, attention.o_proj.bias),
         "gate_proj": (layer.mlp.gate_proj.weight, layer.mlp.gate_proj.bias),
         "up_proj": (layer.mlp.up_proj.weight, layer.mlp.up_proj.bias),
         "down_proj": (layer.mlp.down_proj.weight, layer.mlp.down_proj.bias),
