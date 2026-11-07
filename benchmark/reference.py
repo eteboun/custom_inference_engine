@@ -6,19 +6,18 @@ from pathlib import Path
 import torch
 from transformers import AutoModelForCausalLM
 
-from common import MODEL_ID
-
 
 REFERENCE_DIR = Path(__file__).resolve().parent.parent / "results" / "reference"
 
 
 def generate_references(
+        model_id: str,
         requests: list[list[int]],
         eos_token_ids: list[int],
         max_new_tokens: int
 ) -> list[list[int]]:
     model = AutoModelForCausalLM.from_pretrained(
-        MODEL_ID, dtype=torch.float16
+        model_id, dtype=torch.float16
     ).to("cuda").eval()
 
     references = []
@@ -47,6 +46,7 @@ def generate_references(
 
 
 def load_references(
+        model_id: str,
         requests: list[list[int]],
         eos_token_ids: set[int],
         max_new_tokens: int
@@ -55,15 +55,15 @@ def load_references(
     key = hashlib.sha256(
         json.dumps([requests, eos, max_new_tokens]).encode()
     ).hexdigest()[:16]
-    path = REFERENCE_DIR / f"{key}.json"
+    path = REFERENCE_DIR / model_id.replace("/", "--") / f"{key}.json"
 
     if path.exists():
         with open(path) as f:
             return json.load(f)
 
-    references = generate_references(requests, eos, max_new_tokens)
+    references = generate_references(model_id, requests, eos, max_new_tokens)
 
-    REFERENCE_DIR.mkdir(parents=True, exist_ok=True)
+    path.parent.mkdir(parents=True, exist_ok=True)
     with open(path, "w") as f:
         json.dump(references, f)
 

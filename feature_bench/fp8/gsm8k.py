@@ -6,21 +6,19 @@ import re
 import subprocess
 import sys
 import tempfile
-import threading
 import time
 from pathlib import Path
 
-import torch
-from transformers import AutoTokenizer, GenerationConfig
+from transformers import AutoTokenizer
 
+from benchmark.serve import ENGINES, QUANTIZATION, build_server, load_eos_token_ids
 from common import MODEL_ID
 from feature_bench.common import PAGE_SIZE, save_report
-from scheduler.scheduler import Scheduler
+from scheduler.models import ComponentInitStats
 
 RESULTS_DIR = Path(__file__).resolve().parent / "results"
 DATASET = Path(__file__).resolve().parents[1] / "datasets" / "gsm8k" / "test.jsonl"
-VARIANTS = ["fp16", "fp8"]
-INIT_COMPONENTS = ["model", "kv_cache", "piecewise", "full"]
+PAIRS = [("ours", "ours-fp8"), ("vllm", "vllm-fp8"), ("ours", "vllm"), ("ours-fp8", "vllm-fp8")]
 INSTRUCTION = "Please reason step by step, and put your final answer within \\boxed{}."
 NUMBER = re.compile(r"-?\d[\d,]*(?:\.\d+)?")
 
@@ -62,38 +60,33 @@ def build_prompts(tokenizer, questions: list[dict]) -> list[list[int]]:
     ]
 
 
-def run_worker(variant: str, args: argparse.Namespace) -> None:
-    tokenizer = AutoTokenizer.from_pretrained(MODEL_ID)
-    eos = GenerationConfig.from_pretrained(MODEL_ID).eos_token_id
-    eos_token_ids = set(eos) if isinstance(eos, list) else {eos}
+def run_worker(engine: str, args: argparse.Namespace) -> None:
+    tokenizer = AutoTokenizer.from_pretrained(args.model)
+    eos_token_ids = load_eos_token_ids(args.model, tokenizer)
 
     questions = load_questions(args.limit)
     prompts = build_prompts(tokenizer, questions)
 
-    engine = Scheduler(
-        model_id=MODEL_ID,
-        eos_token_ids=eos_token_ids,
-        max_new_tokens=args.max_new_tokens,
-        n_slots=args.n_slots,
-        page_size=PAGE_SIZE,
-        token_budget=args.token_budget,
-        dtype=torch.float16,
-        quantization="fp8" if variant == "fp8" else None
+    server = build_server(
+        engine,
+        argparse.Namespace(
+            model=args.model,
+            max_new_tokens=args.max_new_tokens,
+            n_slots=args.n_slots,
+            page_size=PAGE_SIZE,
+            token_budget=args.token_budget,
+        ),
+        eos_token_ids
     )
-    thread = threading.Thread(target=engine.loop, daemon=True)
-    thread.start()
 
     start = time.perf_counter()
-    futures = [engine.call(prompt) for prompt in prompts]
-    results = [future.result() for future in futures]
+    result = server.serve(requests=prompts, arrivals=[0.0] * len(prompts))
     seconds = time.perf_counter() - start
-
-    engine.stop()
-    thread.join()
+    server.close()
 
     answers = []
-    for question, result in zip(questions, results):
-        tokens = result.new_tokens
+    for question, timed in zip(questions, result.output):
+        tokens = timed.result.new_tokens
         text = tokenizer.decode(tokens, skip_special_tokens=True)
         prediction = extract_answer(text)
         reference = reference_answer(question["answer"])
@@ -102,22 +95,23 @@ def run_worker(variant: str, args: argparse.Namespace) -> None:
             "prediction": prediction,
             "correct": prediction is not None and math.isclose(prediction, reference, abs_tol=1e-6),
             "tokens": len(tokens),
-            "truncated": tokens[-1] not in eos_token_ids,
+            "truncated": len(tokens) >= args.max_new_tokens and tokens[-1] not in eos_token_ids,
             "text": text,
         })
 
+    init = result.init
     with open(args.worker_out, "a") as f:
         f.write(json.dumps({
-            "variant": variant,
-            "calibration_seconds": engine.tracker.init.calibration_seconds,
-            "init_seconds": engine.tracker.init.total_seconds,
+            "engine": engine,
+            "calibration_seconds": init.calibration_seconds,
+            "init_seconds": init.total_seconds,
             "init_components": {
-                name: dataclasses.asdict(stats)
-                for name in INIT_COMPONENTS
-                if (stats := getattr(engine.tracker.init, name)) is not None
+                field.name: dataclasses.asdict(stats)
+                for field in dataclasses.fields(init)
+                if isinstance(stats := getattr(init, field.name), ComponentInitStats)
             },
             "generation_seconds": seconds,
-            "preemptions": engine.tracker.run.preemptions,
+            "preemptions": None if result.run is None else result.run.preemptions,
             "answers": answers,
         }) + "\n")
 
@@ -134,7 +128,7 @@ def accuracy_row(run: dict) -> list:
     answers = run["answers"]
     tokens = sum(a["tokens"] for a in answers)
     return [
-        run["variant"], len(answers),
+        run["engine"], len(answers),
         sum(a["correct"] for a in answers),
         sum(a["correct"] for a in answers) / len(answers),
         sum(a["prediction"] is None for a in answers),
@@ -149,92 +143,95 @@ def accuracy_row(run: dict) -> list:
     ]
 
 
-def paired_row(name: str, pairs: list[tuple[dict, dict]]) -> list:
-    fp16_only = sum(a["correct"] and not b["correct"] for a, b in pairs)
-    fp8_only = sum(b["correct"] and not a["correct"] for a, b in pairs)
+def paired_row(first: str, second: str, subset: str, pairs: list[tuple[dict, dict]]) -> list:
+    first_only = sum(a["correct"] and not b["correct"] for a, b in pairs)
+    second_only = sum(b["correct"] and not a["correct"] for a, b in pairs)
     return [
-        name, len(pairs),
+        first, second, subset, len(pairs),
         sum(a["correct"] and b["correct"] for a, b in pairs),
-        fp16_only,
-        fp8_only,
+        first_only,
+        second_only,
         sum(not a["correct"] and not b["correct"] for a, b in pairs),
-        mcnemar_p(fp16_only, fp8_only),
+        mcnemar_p(first_only, second_only),
     ]
 
 
 def build_tables(runs: dict[str, dict]) -> list[dict]:
-    fp16 = runs["fp16"]["answers"]
-    fp8 = runs["fp8"]["answers"]
-    pairs = list(zip(fp16, fp8))
-    complete = [(a, b) for a, b in pairs if not a["truncated"] and not b["truncated"]]
+    pairs = [(first, second) for first, second in PAIRS if first in runs and second in runs]
 
-    return [
-        {
-            "title": "Accuracy",
+    paired_rows = []
+    discordant_tables = []
+    for first, second in pairs:
+        both = list(zip(runs[first]["answers"], runs[second]["answers"]))
+        complete = [(a, b) for a, b in both if not a["truncated"] and not b["truncated"]]
+        paired_rows.append(paired_row(first, second, "all", both))
+        paired_rows.append(paired_row(first, second, "neither hit max_new_tokens", complete))
+        discordant_tables.append({
+            "title": f"Questions where only one of {first} and {second} is correct",
             "columns": [
-                "variant", "questions", "correct", "accuracy", "no answer found",
-                "hit max_new_tokens", "correct among hit max_new_tokens", "mean generated tokens",
-                "generation seconds", "generated tokens/s", "scheduler init seconds",
-                "calibration seconds", "preemptions",
-            ],
-            "rows": [accuracy_row(runs[variant]) for variant in VARIANTS],
-        },
-        {
-            "title": "Scheduler init",
-            "columns": [
-                "variant", "component", "seconds", "memory MiB",
-                "allocated after MiB", "reserved after MiB",
-            ],
-            "rows": [
-                [
-                    variant, name, stats["seconds"], stats["memory"] / 2 ** 20,
-                    stats["memory_allocated"] / 2 ** 20, stats["memory_reserved"] / 2 ** 20,
-                ]
-                for variant in VARIANTS
-                for name, stats in runs[variant]["init_components"].items()
-            ] + [
-                [variant, "total", runs[variant]["init_seconds"], None, None, None]
-                for variant in VARIANTS
-            ],
-        },
-        {
-            "title": "Paired by question",
-            "columns": [
-                "questions", "count", "both correct", "fp16 only", "fp8 only", "both wrong",
-                "McNemar exact p",
-            ],
-            "rows": [
-                paired_row("all", pairs),
-                paired_row("neither hit max_new_tokens", complete),
-            ],
-        },
-        {
-            "title": "Questions where only one variant is correct",
-            "columns": [
-                "index", "reference", "fp16 prediction", "fp8 prediction",
-                "fp16 tokens", "fp8 tokens", "fp16 hit max_new_tokens", "fp8 hit max_new_tokens",
+                "index", "reference", f"{first} prediction", f"{second} prediction",
+                f"{first} tokens", f"{second} tokens",
+                f"{first} hit max_new_tokens", f"{second} hit max_new_tokens",
             ],
             "rows": [
                 [
                     i, a["reference"], a["prediction"], b["prediction"], a["tokens"], b["tokens"],
                     a["truncated"], b["truncated"],
                 ]
-                for i, (a, b) in enumerate(pairs)
+                for i, (a, b) in enumerate(both)
                 if a["correct"] != b["correct"]
             ],
+        })
+
+    return [
+        {
+            "title": "Accuracy",
+            "columns": [
+                "engine", "questions", "correct", "accuracy", "no answer found",
+                "hit max_new_tokens", "correct among hit max_new_tokens", "mean generated tokens",
+                "generation seconds", "generated tokens/s", "init seconds",
+                "calibration seconds", "preemptions",
+            ],
+            "rows": [accuracy_row(run) for run in runs.values()],
         },
+        {
+            "title": "Init components",
+            "columns": [
+                "engine", "component", "seconds", "memory MiB",
+                "allocated after MiB", "reserved after MiB",
+            ],
+            "rows": [
+                [
+                    engine, name, stats["seconds"], stats["memory"] / 2 ** 20,
+                    stats["memory_allocated"] / 2 ** 20, stats["memory_reserved"] / 2 ** 20,
+                ]
+                for engine, run in runs.items()
+                for name, stats in run["init_components"].items()
+            ],
+        },
+        {
+            "title": "Paired by question",
+            "columns": [
+                "first", "second", "questions", "count", "both correct", "first only",
+                "second only", "both wrong", "McNemar exact p",
+            ],
+            "rows": paired_rows,
+        },
+        *discordant_tables,
     ]
 
 
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--title", default=None)
+    parser.add_argument("--model", default=MODEL_ID)
+    parser.add_argument("--engines", nargs="+", choices=ENGINES, default=ENGINES)
     parser.add_argument("--limit", type=int, default=None)
     parser.add_argument("--max-new-tokens", type=int, default=1024)
     parser.add_argument("--n-slots", type=int, default=33)
     parser.add_argument("--token-budget", type=int, default=1024)
     parser.add_argument("--results-dir", type=Path, default=RESULTS_DIR)
-    parser.add_argument("--worker", choices=VARIANTS, default=None)
+    parser.add_argument("--worker", choices=ENGINES, default=None)
     parser.add_argument("--worker-out", type=Path, default=None)
     args = parser.parse_args()
 
@@ -246,6 +243,7 @@ def main() -> None:
         parser.error("--title is required")
 
     worker_args = [
+        "--model", args.model,
         "--max-new-tokens", str(args.max_new_tokens),
         "--n-slots", str(args.n_slots),
         "--token-budget", str(args.token_budget),
@@ -255,11 +253,11 @@ def main() -> None:
 
     with tempfile.TemporaryDirectory() as tmp:
         worker_out = Path(tmp) / "runs.jsonl"
-        for variant in VARIANTS:
+        for engine in args.engines:
             subprocess.run(
                 [
                     sys.executable, "-m", "feature_bench.fp8.gsm8k",
-                    "--worker", variant,
+                    "--worker", engine,
                     "--worker-out", str(worker_out),
                     *worker_args,
                 ],
@@ -267,14 +265,16 @@ def main() -> None:
             )
 
         with open(worker_out) as f:
-            runs = {run["variant"]: run for run in map(json.loads, f)}
+            runs = {run["engine"]: run for run in map(json.loads, f)}
 
     path = save_report(
         name="gsm8k",
         title=args.title,
         settings={
             "dataset": "GSM8K test (openai/grade-school-math)",
-            "variants": VARIANTS,
+            "model": args.model,
+            "engines": args.engines,
+            "quantization": {engine: QUANTIZATION.get(engine) for engine in args.engines},
             "instruction": INSTRUCTION,
             "answer": "first number after the last \\boxed{, else the last number in the output",
             "decoding": "greedy",
@@ -291,7 +291,7 @@ def main() -> None:
                 "index": i,
                 "question": question["question"],
                 "reference": question["answer"],
-                **{variant: runs[variant]["answers"][i] for variant in VARIANTS},
+                **{engine: runs[engine]["answers"][i] for engine in runs},
             }
             for i, question in enumerate(load_questions(args.limit))
         ]

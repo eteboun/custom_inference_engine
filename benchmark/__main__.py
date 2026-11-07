@@ -6,31 +6,20 @@ import subprocess
 import sys
 from pathlib import Path
 
-from transformers import AutoTokenizer, GenerationConfig
+from transformers import AutoTokenizer
 
 from benchmark.metrics import summarize
 from benchmark.reference import load_references
 from benchmark.report import create_run_dir, save_report, write_run_html
-from benchmark.serve import OursServer, Server, VllmServer
+from benchmark.serve import ENGINES, QUANTIZATION, build_server, load_eos_token_ids
 from benchmark.workload import WorkloadInfo, build_workload, poisson_arrivals
 from common import MODEL_ID
-
-ENGINES = ["ours", "ours-fp8", "vllm", "vllm-fp8"]
-QUANTIZATION = {"ours-fp8": "fp8", "vllm-fp8": "fp8_per_tensor"}
-
-
-def load_eos_token_ids(tokenizer) -> set[int]:
-    eos = GenerationConfig.from_pretrained(MODEL_ID).eos_token_id
-    if eos is None:
-        eos = tokenizer.eos_token_id
-    if isinstance(eos, int):
-        eos = [eos]
-    return set(eos)
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--title", required=True)
+    parser.add_argument("--model", default=MODEL_ID)
     parser.add_argument("--engines", nargs="+", choices=ENGINES, default=["ours", "vllm"])
     parser.add_argument("--kinds", nargs="+", choices=["short", "long", "mixed"], default=["short", "long", "mixed"])
     parser.add_argument("--rates", type=float, nargs="+", default=[4.0, 8.0, float("inf")])
@@ -52,8 +41,8 @@ def run_engine(args: argparse.Namespace) -> None:
     engine: str = args.worker_engine
     run_dir: Path = args.run_dir
 
-    tokenizer = AutoTokenizer.from_pretrained(MODEL_ID)
-    eos_token_ids = load_eos_token_ids(tokenizer)
+    tokenizer = AutoTokenizer.from_pretrained(args.model)
+    eos_token_ids = load_eos_token_ids(args.model, tokenizer)
 
     workloads: dict[str, tuple[list[list[int]], WorkloadInfo, list[list[int]]]] = {}
     for kind in args.kinds:
@@ -64,18 +53,14 @@ def run_engine(args: argparse.Namespace) -> None:
             seed=args.seed
         )
         references = load_references(
+            model_id=args.model,
             requests=requests,
             eos_token_ids=eos_token_ids,
             max_new_tokens=args.max_new_tokens
         )
         workloads[kind] = requests, info, references
 
-    quantization = QUANTIZATION.get(engine)
-    server: Server = (
-        OursServer(args, eos_token_ids, quantization)
-        if engine.startswith("ours")
-        else VllmServer(args, eos_token_ids, quantization)
-    )
+    server = build_server(engine, args, eos_token_ids)
 
     warmup_requests, _ = build_workload(
         tokenizer=tokenizer,
@@ -89,13 +74,14 @@ def run_engine(args: argparse.Namespace) -> None:
     )
 
     settings = {
+        "model": args.model,
         "n_requests": args.n_requests,
         "max_new_tokens": args.max_new_tokens,
         "n_slots": args.n_slots,
         "page_size": args.page_size,
         "token_budget": args.token_budget,
         "prompt_seed": args.seed,
-        "quantization": quantization,
+        "quantization": QUANTIZATION.get(engine),
     }
 
     configs = list(itertools.product(range(args.repeats), args.kinds, args.rates))

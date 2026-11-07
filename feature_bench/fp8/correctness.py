@@ -416,6 +416,7 @@ def main() -> None:
     for kind in KINDS:
         prompts, _ = build_workload(tokenizer, kind=kind, n=args.n_prompts, seed=args.seed)
         tokens = load_references(
+            model_id=MODEL_ID,
             requests=prompts,
             eos_token_ids=eos_token_ids,
             max_new_tokens=args.max_new_tokens

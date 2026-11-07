@@ -5,12 +5,24 @@ import time
 from typing import Protocol
 
 import torch
+from transformers import GenerationConfig
 
 from benchmark.client import benchmark
 from benchmark.report import ServeResult
-from common import MODEL_ID
 from scheduler.models import InitStats, RunStats
 from scheduler.scheduler import Scheduler
+
+ENGINES = ["ours", "ours-fp8", "vllm", "vllm-fp8"]
+QUANTIZATION = {"ours-fp8": "fp8", "vllm-fp8": "fp8_per_tensor"}
+
+
+def load_eos_token_ids(model_id: str, tokenizer) -> set[int]:
+    eos = GenerationConfig.from_pretrained(model_id).eos_token_id
+    if eos is None:
+        eos = tokenizer.eos_token_id
+    if isinstance(eos, int):
+        eos = [eos]
+    return set(eos)
 
 
 class Server(Protocol):
@@ -25,7 +37,7 @@ class OursServer:
 
     def __init__(self, args: argparse.Namespace, eos_token_ids: set[int], quantization: str | None) -> None:
         self.engine = Scheduler(
-            model_id=MODEL_ID,
+            model_id=args.model,
             eos_token_ids=eos_token_ids,
             max_new_tokens=args.max_new_tokens,
             n_slots=args.n_slots,
@@ -66,6 +78,7 @@ class VllmServer:
 
         start = time.perf_counter()
         self.engine = build_vllm_engine(
+            model=args.model,
             max_num_seqs=args.n_slots - 1,
             max_num_batched_tokens=args.token_budget,
             quantization=quantization
@@ -93,3 +106,10 @@ class VllmServer:
 
     def close(self) -> None:
         pass
+
+
+def build_server(engine: str, args: argparse.Namespace, eos_token_ids: set[int]) -> Server:
+    quantization = QUANTIZATION.get(engine)
+    if engine.startswith("ours"):
+        return OursServer(args, eos_token_ids, quantization)
+    return VllmServer(args, eos_token_ids, quantization)
