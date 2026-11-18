@@ -143,10 +143,6 @@ python -m benchmark --title "<architecture of this run>"
 bash benchmark/smoke_test.sh    # short check of the whole path
 ```
 
-The smoke script runs `ours`, `ours-fp8`, `vllm`, and `vllm-fp8` in separate processes,
-with 32 requests per configuration, four active slots, and a 256-token step budget.
-Graph compilation and capture still run at startup.
-
 Each run creates a folder:
 
 ```text
