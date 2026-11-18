@@ -10,7 +10,7 @@ import torch
 from benchmark.metrics import OverallMetrics, RequestMetrics, TimedResult
 from benchmark.workload import WorkloadInfo
 from feature_bench.html_report import render_page, render_table
-from scheduler.models import ComponentInitStats, InitStats, RunStats
+from scheduler.models import ComponentInitStats, InitStats, GeneralStats
 
 
 RESULTS_DIR = Path(__file__).resolve().parent.parent / "results"
@@ -26,7 +26,7 @@ SUMMARIZED_TABLES = {"Throughput", "Latency (ms)", "Reference match", "Init"}
 class ServeResult:
     output: list[TimedResult]
     init: InitStats
-    run: RunStats | None = None
+    run: GeneralStats | None = None
 
 
 def git_state() -> dict[str, str | bool]:
@@ -122,11 +122,13 @@ def init_table(init: InitStats) -> dict:
     }
 
 
-def run_tables(run: RunStats) -> list[dict]:
+def run_tables(run: GeneralStats) -> list[dict]:
+    executor = run.executor
+    scheduler = run.scheduler
     steps = [
-        *(["decode", str(bucket), count] for bucket, count in sorted(run.decode_steps.items())),
-        *(["full mixed", str(bucket), count] for bucket, count in sorted(run.full_mixed_steps.items())),
-        *(["piecewise mixed", str(bucket), count] for bucket, count in sorted(run.piecewise_mixed_steps.items())),
+        *(["decode", str(bucket), count] for bucket, count in sorted(executor.decode_steps.items())),
+        *(["full mixed", str(bucket), count] for bucket, count in sorted(executor.full_mixed_steps.items())),
+        *(["piecewise mixed", str(bucket), count] for bucket, count in sorted(executor.piecewise_mixed_steps.items())),
     ]
     return [
         {
@@ -137,12 +139,12 @@ def run_tables(run: RunStats) -> list[dict]:
         {
             "title": "Steps per real batch size",
             "columns": ["batch size", "steps"],
-            "rows": [[size, count] for size, count in sorted(run.batch_sizes.items())],
+            "rows": [[size, count] for size, count in sorted(executor.batch_sizes.items())],
         },
         {
             "title": "Scheduler counters",
             "columns": ["mixed tokens", "mixed bucket tokens", "preemptions", "recomputed tokens"],
-            "rows": [[run.tokens, run.bucket_tokens, run.preemptions, run.recomputed_tokens]],
+            "rows": [[executor.tokens, executor.bucket_tokens, scheduler.preemptions, scheduler.recomputed_tokens]],
         },
     ]
 

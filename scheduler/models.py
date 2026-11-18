@@ -48,18 +48,28 @@ class InitStats:
 
 
 @dataclass
-class RunStats:
-    decode_steps: Counter = field(default_factory=Counter)
-    full_mixed_steps: Counter = field(default_factory=Counter)
-    piecewise_mixed_steps: Counter = field(default_factory=Counter)
-    batch_sizes: Counter = field(default_factory=Counter)
+class CudaGraphExecutorStats:
+    batch_sizes: Counter[int] = field(default_factory=Counter)
+    decode_steps: Counter[int] = field(default_factory=Counter)
+    full_mixed_steps: Counter[tuple[int, int]] = field(default_factory=Counter)
+    piecewise_mixed_steps: Counter[int] = field(default_factory=Counter)
     tokens: int = 0
     bucket_tokens: int = 0
+
+
+@dataclass
+class SchedulerStats:
     preemptions: int = 0
     recomputed_tokens: int = 0
 
 
 @dataclass
+class GeneralStats:
+    executor: CudaGraphExecutorStats = field(default_factory=CudaGraphExecutorStats)
+    scheduler: SchedulerStats = field(default_factory=SchedulerStats)
+
+
+@dataclass
 class Tracker:
     init: InitStats = field(default_factory=InitStats)
-    run: RunStats = field(default_factory=RunStats)
+    run: GeneralStats = field(default_factory=GeneralStats)

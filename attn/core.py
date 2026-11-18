@@ -11,6 +11,7 @@ from kernels.decode_attention import (
     decode_gqa_attention_kernel_load, decode_attention_kernel_merge
 )
 from kernels.prefill_attention import mixed_gqa_attention_kernel
+from quant.core import Fp8Linear
 
 
 def decode_gqa_attention(q, k, v, lens, slot_ids, block_table, num_programs, BLOCK_N=64, num_warps=4,
@@ -151,30 +152,74 @@ def merge_projections(projs: list[torch.nn.Linear]) -> torch.nn.Linear:
     return merged
 
 
-class MergedQwen2Attention(Qwen2Attention):
+def project_qkv(attention, hidden_states):
+    if hasattr(attention, "qkv"):
+        return attention.qkv(hidden_states).split(attention.qkv_sizes, dim=-1)
+    if isinstance(attention.q_proj, Fp8Linear):
+        x_fp8, scale = attention.q_proj.quantize_input(hidden_states)
+        return (
+            attention.q_proj.forward_quantized(x_fp8, scale),
+            attention.k_proj.forward_quantized(x_fp8, scale),
+            attention.v_proj.forward_quantized(x_fp8, scale),
+        )
+    return (
+        attention.q_proj(hidden_states),
+        attention.k_proj(hidden_states),
+        attention.v_proj(hidden_states),
+    )
 
-    def __init__(self, original: Qwen2Attention) -> None:
+
+def replace_attention(module):
+    for name, child in module.named_children():
+        if type(child) in (Qwen2Attention, _Qwen2Attention):
+            setattr(module, name, TritonQwen2Attention(child))
+        else:
+            replace_attention(child)
+
+
+def wrap_qwen2_attention(module, *, merge_qkv: bool = False) -> None:
+    for name, child in module.named_children():
+        if type(child) is Qwen2Attention:
+            setattr(module, name, _Qwen2Attention(child, merge_qkv=merge_qkv))
+        else:
+            wrap_qwen2_attention(child, merge_qkv=merge_qkv)
+
+
+def use_triton_attention(model):
+    if not getattr(model, "_uses_triton_attention", False):
+        replace_attention(model)
+        model._uses_triton_attention = True
+
+
+class _Qwen2Attention(Qwen2Attention):
+
+    def __init__(self, original: Qwen2Attention, *, merge_qkv: bool = False) -> None:
         with torch.device("meta"):
             super().__init__(original.config, original.layer_idx)
         self.eval()
 
-        if isinstance(original, MergedQwen2Attention):
+        if hasattr(original, "qkv"):
             self.qkv = original.qkv
             self.qkv_sizes = original.qkv_sizes
-        else:
+        elif merge_qkv:
             projs = [original.q_proj, original.k_proj, original.v_proj]
             assert all(p.bias is not None for p in projs)
             self.qkv = merge_projections(projs)
             self.qkv_sizes = [p.out_features for p in projs]
+        else:
+            self.q_proj = original.q_proj
+            self.k_proj = original.k_proj
+            self.v_proj = original.v_proj
         self.o_proj = original.o_proj
-        del self.q_proj, self.k_proj, self.v_proj
+        if hasattr(self, "qkv"):
+            del self.q_proj, self.k_proj, self.v_proj
 
     def forward(self, hidden_states, position_embeddings, attention_mask,
                 past_key_values=None, **kwargs):
         input_shape = hidden_states.shape[:-1]
         hidden_shape = (*input_shape, -1, self.head_dim)
 
-        q, k, v = self.qkv(hidden_states).split(self.qkv_sizes, dim=-1)
+        q, k, v = project_qkv(self, hidden_states)
         query_states = q.view(hidden_shape).transpose(1, 2)
         key_states = k.view(hidden_shape).transpose(1, 2)
         value_states = v.view(hidden_shape).transpose(1, 2)
@@ -206,18 +251,10 @@ class MergedQwen2Attention(Qwen2Attention):
         return attn_output, attn_weights
 
 
-def merge_qkv(module) -> None:
-    for name, child in module.named_children():
-        if type(child) is Qwen2Attention:
-            setattr(module, name, MergedQwen2Attention(child))
-        else:
-            merge_qkv(child)
-
-
-class TritonQwen2Attention(MergedQwen2Attention):
+class TritonQwen2Attention(_Qwen2Attention):
 
     def __init__(self, original: Qwen2Attention) -> None:
-        super().__init__(original)
+        super().__init__(original, merge_qkv=True)
         assert self.sliding_window is None, "sliding window desteklenmiyor"
         assert self.scaling == self.head_dim ** -0.5
         self.num_heads = self.config.num_attention_heads
@@ -225,10 +262,7 @@ class TritonQwen2Attention(MergedQwen2Attention):
     def forward(self, hidden_states, position_embeddings, attention_mask=None,
                 past_key_values=None, kv_manager=None, **kwargs):
         if kv_manager is None:
-            return super().forward(
-                hidden_states, position_embeddings, attention_mask,
-                past_key_values=past_key_values, **kwargs
-            )
+            raise ValueError("Triton attention requires a kv_manager.")
 
         metadata = kwargs.get("metadata")
         if metadata is None:
@@ -238,7 +272,7 @@ class TritonQwen2Attention(MergedQwen2Attention):
 
         total_T = hidden_states.shape[1]
         hidden_shape = (1, total_T, -1, self.head_dim)
-        q, k, v = self.qkv(hidden_states).split(self.qkv_sizes, dim=-1)
+        q, k, v = project_qkv(self, hidden_states)
 
         # (1, total_T, H, D)
         query_states = q.view(hidden_shape)
@@ -260,15 +294,6 @@ class TritonQwen2Attention(MergedQwen2Attention):
                 value_states
             )
 
-            o = gqa_decode_attention_op(
-                query_states,
-                kv_manager.keys[self.layer_idx],
-                kv_manager.values[self.layer_idx],
-                kv_manager.lens[metadata.slot_ids] + 1,
-                slot_ids=metadata.slot_ids,
-                block_table=kv_manager.block_table
-            )
-
         else:
             kv_manager.mixed_update(
                 self.layer_idx,
@@ -278,28 +303,26 @@ class TritonQwen2Attention(MergedQwen2Attention):
                 value_states
             )
 
-            o = gqa_mixed_attention_op(
-                query_states,
-                kv_manager.keys[self.layer_idx],
-                kv_manager.values[self.layer_idx],
-                kv_lens=kv_manager.lens[metadata.slot_ids],
-                max_seqlen=metadata.max_seqlen, cu_seqlens=metadata.cu_seqlens,
-                slot_ids=metadata.slot_ids, block_table=kv_manager.block_table
-            )
-
+        o = self.paged_attention(query_states, kv_manager, metadata)
         attn_output = self.o_proj(o.reshape(1, total_T, self.num_heads * self.head_dim))
         return attn_output, None
 
+    def paged_attention(self, query_states, kv_manager, metadata):
+        if metadata.full_decode:
+            return gqa_decode_attention_op(
+                query_states,
+                kv_manager.keys[self.layer_idx],
+                kv_manager.values[self.layer_idx],
+                kv_manager.lens[metadata.slot_ids] + 1,
+                slot_ids=metadata.slot_ids,
+                block_table=kv_manager.block_table
+            )
 
-def replace_attention(module):
-    for name, child in module.named_children():
-        if type(child) in (Qwen2Attention, MergedQwen2Attention):
-            setattr(module, name, TritonQwen2Attention(child))
-        else:
-            replace_attention(child)
-
-
-def use_triton_attention(model):
-    if not getattr(model, "_uses_triton_attention", False):
-        replace_attention(model)
-        model._uses_triton_attention = True
+        return gqa_mixed_attention_op(
+            query_states,
+            kv_manager.keys[self.layer_idx],
+            kv_manager.values[self.layer_idx],
+            kv_lens=kv_manager.lens[metadata.slot_ids],
+            max_seqlen=metadata.max_seqlen, cu_seqlens=metadata.cu_seqlens,
+            slot_ids=metadata.slot_ids, block_table=kv_manager.block_table
+        )

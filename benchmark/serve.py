@@ -9,7 +9,7 @@ from transformers import GenerationConfig
 
 from benchmark.client import benchmark
 from benchmark.report import ServeResult
-from scheduler.models import InitStats, RunStats
+from scheduler.models import InitStats, GeneralStats
 from scheduler.scheduler import Scheduler
 
 ENGINES = ["ours", "ours-fp8", "vllm", "vllm-fp8"]
@@ -50,7 +50,7 @@ class OursServer:
         self.thread.start()
 
     def serve(self, requests: list[list[int]], arrivals: list[float]) -> ServeResult:
-        self.engine.tracker.run = RunStats()
+        self.engine.tracker.run = GeneralStats()
 
         output = asyncio.run(
             benchmark(

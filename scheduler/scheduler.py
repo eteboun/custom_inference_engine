@@ -5,10 +5,8 @@ from concurrent.futures import Future, InvalidStateError
 
 import torch
 from typing import ClassVar
-from model_loader import build_model
-from scheduler.models import ComponentInitStats, Request, RequestResult, Tracker
-from kv_cache.storage import KVStorage
-from scheduler.graph_backend import FullGraphBackend, PiecewiseGraphBackend
+from scheduler.executor import CudaGraphExecutor
+from scheduler.models import Request, RequestResult, Tracker
 
 
 class Scheduler:
@@ -70,40 +68,31 @@ class Scheduler:
                 "token_budget must be a multiple of PIECEWISE_TOKEN_STEP."
             )
 
-        self.tracker = Tracker()
-
-        start = time.perf_counter()
-        allocated_before = torch.cuda.memory_allocated()
-        model = build_model(model_id, dtype, quantization)
-        self.tracker.init.model = self._init_stats(start, allocated_before)
-        self.tracker.init.calibration_seconds = model.calibration_seconds
-
-        self.model = model
         self.max_new_tokens = max_new_tokens
         self.n_slots = n_slots
         self.page_size = page_size
         self.token_budget = token_budget
         self.eos_token_ids = frozenset(eos_token_ids)
 
-        start = time.perf_counter()
-        allocated_before = torch.cuda.memory_allocated()
-        self.kv_cache = KVStorage(
-            config=model.config,
-            max_cache_len=self.KV_CACHE_CAPACITY,
-            n_slots=n_slots,
-            page_size=page_size,
-            device=model.device,
-            dtype=dtype
-        )
-        self.tracker.init.kv_cache = self._init_stats(start, allocated_before)
-        self.n_pages = self.kv_cache.n_pages
-
+        self.n_pages = math.ceil(self.KV_CACHE_CAPACITY / page_size)
         if self._required_pages(1, True) > self.n_pages - 1:
             raise ValueError(
                 f"max_new_tokens can't need more than {self.n_pages - 1} pages."
             )
 
-        self._generate_backends()
+        self.executor = CudaGraphExecutor(
+            model_id=model_id,
+            dtype=dtype,
+            kv_cache_capacity=self.KV_CACHE_CAPACITY,
+            n_slots=n_slots,
+            page_size=page_size,
+            batch_sizes=self._batch_buckets(),
+            full_token_counts=self._full_token_buckets(),
+            piecewise_token_counts=self._piecewise_token_buckets(),
+            quantization=quantization,
+        )
+        self.kv_cache = self.executor.kv_cache
+        self.tracker = Tracker(init=self.executor.init_stats)
 
         self.requests = queue.Queue()
         self.preempted: list[Request] = []
@@ -150,50 +139,6 @@ class Scheduler:
             self.token_budget + self.PIECEWISE_TOKEN_STEP,
             self.PIECEWISE_TOKEN_STEP
         ))
-
-    def _generate_backends(self) -> None:
-        batch_sizes = self._batch_buckets()
-        full_token_counts = self._full_token_buckets()
-        piecewise_token_counts = self._piecewise_token_buckets()
-
-        torch._dynamo.config.recompile_limit = max(
-            torch._dynamo.config.recompile_limit,
-            len(batch_sizes) * len(full_token_counts)
-            + 2 * len(piecewise_token_counts)
-        )
-
-        self.graph_pool = torch.cuda.graph_pool_handle()
-
-        start = time.perf_counter()
-        allocated_before = torch.cuda.memory_allocated()
-        self.piecewise_backend = PiecewiseGraphBackend(
-            model=self.model,
-            kv_cache=self.kv_cache,
-            token_counts=piecewise_token_counts,
-            pool=self.graph_pool
-        )
-        self.tracker.init.piecewise = self._init_stats(start, allocated_before)
-
-        start = time.perf_counter()
-        allocated_before = torch.cuda.memory_allocated()
-        self.full_backend = FullGraphBackend(
-            model=self.model,
-            kv_cache=self.kv_cache,
-            batch_sizes=batch_sizes,
-            token_counts=full_token_counts,
-            pool=self.graph_pool
-        )
-        self.tracker.init.full = self._init_stats(start, allocated_before)
-
-    @staticmethod
-    def _init_stats(start: float, allocated_before: int) -> ComponentInitStats:
-        allocated = torch.cuda.memory_allocated()
-        return ComponentInitStats(
-            seconds=time.perf_counter() - start,
-            memory=allocated - allocated_before,
-            memory_allocated=allocated,
-            memory_reserved=torch.cuda.memory_reserved()
-        )
 
     def _required_pages(
             self,
@@ -345,10 +290,10 @@ class Scheduler:
         reqs = [self.slots[id_] for id_ in slot_ids]
         self._clear(slot_ids)
 
-        self.tracker.run.preemptions += len(reqs)
+        self.tracker.run.scheduler.preemptions += len(reqs)
 
         for req in reqs:
-            self.tracker.run.recomputed_tokens += req.kv_len
+            self.tracker.run.scheduler.recomputed_tokens += req.kv_len
             req.prefilled = False
             req.kv_len = 0
             req.pages = set()
@@ -643,68 +588,19 @@ class Scheduler:
         )
 
     def _process_slots(self) -> None:
-
-        input_slots = []
-        kernel = "decode"
-        for id_ in self._filled_slots:
-            req = self.slots[id_]
-
-            if req.budget == 0:
-                continue
-
-            if not req.prefilled:
-                kernel = "mixed"
-
-            input_slots.append(id_)
-
+        input_slots = [
+            slot_id for slot_id in self._filled_slots if self.slots[slot_id].budget > 0
+        ]
         if not input_slots:
             return
 
-        run_stats = self.tracker.run
-        run_stats.batch_sizes[len(input_slots)] += 1
-
-        if kernel == "decode":
-            decode_module = self.full_backend.get_decode_module(
-                len(input_slots)
-            )
-            run_stats.decode_steps[decode_module.batch_size] += 1
-            new_tokens = decode_module.forward(
-                slot_ids=input_slots
-            )
-
-        else:
+        prompts = None
+        if any(not self.slots[slot_id].prefilled for slot_id in input_slots):
             prompts = []
-            for id_ in input_slots:
-                req = self.slots[id_]
-
+            for slot_id in input_slots:
+                req = self.slots[slot_id]
                 full_prompt = req.prompt + req.new_tokens
-                allocated = full_prompt[req.kv_len: req.kv_len + req.budget]
+                prompts.append(full_prompt[req.kv_len: req.kv_len + req.budget])
 
-                prompts.append(allocated)
-
-            token_count = sum(map(len, prompts))
-            if token_count <= self.FULL_GRAPH_TOKEN_THRESHOLD:
-                mixed_module = self.full_backend.get_mixed_module(
-                    len(input_slots), token_count
-                )
-                run_stats.full_mixed_steps[
-                    (mixed_module.batch_size, mixed_module.token_count)
-                ] += 1
-            else:
-                mixed_module = self.piecewise_backend.get_mixed_module(
-                    token_count
-                )
-                run_stats.piecewise_mixed_steps[mixed_module.token_count] += 1
-
-            run_stats.tokens += token_count
-            run_stats.bucket_tokens += mixed_module.token_count
-
-            new_tokens = mixed_module.forward(
-                prompts=prompts,
-                slot_ids=input_slots
-            )
-
-        self._refresh_slots(
-            slot_ids=input_slots,
-            next_tokens=new_tokens
-        )
+        next_tokens = self.executor.execute(input_slots, prompts, self.tracker.run.executor)
+        self._refresh_slots(slot_ids=input_slots, next_tokens=next_tokens)

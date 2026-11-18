@@ -17,11 +17,12 @@ model, and a serving benchmark with Poisson arrivals compares the two.
 | `kernels/prefill_attention.py` | Varlen GQA mixed attention: chunked prefill and decode in one kernel |
 | `attn/core.py` | Kernel host functions, `triton_op` wrappers, `TritonQwen2Attention` replacing HF `Qwen2Attention` |
 | `attn/metadata.py` | Attention metadata passed to the forward (slot ids, `cu_seqlens`, pages/offsets) |
-| `model_loader.py` | `build_model`: loads the HF model, merges Q/K/V, optionally applies fp8 and calibrates, then installs Triton attention |
+| `model_loader.py` | `build_model`: loads HF eager attention for reference experiments or merged Q/K/V and paged Triton attention for serving, with optional fp8 calibration |
 | `quant/` | fp8 projections: `Fp8Linear` (`torch._scaled_mm`), `use_fp8`, and calibration of the input scales |
 | `piecewise/` | Piecewise `torch.compile` backend: splits the graph at attention, captures the other pieces as CUDA graphs |
 | `kv_cache/storage.py` | Paged KV pool, block table, per-slot length and last generated token |
 | `scheduler/scheduler.py` | Thread-based scheduler: queue, token budget, page allocation, preemption |
+| `scheduler/executor.py` | Loads the model, prepares the KV cache and CUDA graphs, and dispatches each batch |
 | `scheduler/models.py` | Per-request state and results (`Request`, `RequestResult`), and init and run statistics (`Tracker`) |
 | `scheduler/decode_module.py` | Pure decode forward captured as a CUDA graph |
 | `scheduler/mixed_module.py` | Varlen (prefill + decode) forward: `FullMixedModule` (whole-forward CUDA graph) and `PiecewiseMixedModule` (piecewise CUDA graphs) |
@@ -107,8 +108,8 @@ under `fullgraph=True`. This is why every entry, including `B = 1`, is compiled 
 
 ### Scheduler (`scheduler/scheduler.py`)
 
-`Scheduler.call(prompts)` returns one `Future` per prompt; `loop()` runs in a separate
-thread. The result is `(new_tokens, t_arrival, t_first, t_end)`.
+`Scheduler.call(prompt)` takes one tokenized prompt and returns a `Future`. `loop()` runs
+in a separate thread. `GeneralStats` groups scheduler and executor counters for the report.
 
 Each step:
 
@@ -119,8 +120,8 @@ Each step:
 2. **Admit new requests** (`_accept_requests`): if budget and free slots/pages remain,
    preempted requests are taken first, then queued ones, and pages are allocated for their
    first chunk.
-3. **Forward** (`_process_slots`): slots that received budget go through the decode or the
-   mixed module.
+3. **Forward** (`_process_slots`): the scheduler passes active slots and their token chunks to
+   the executor, which selects decode, full mixed, or piecewise mixed and runs the forward pass.
 4. **State update** (`_refresh_slots`): `kv_len` grows by the budget. The token produced by
    an unfinished prefill chunk is discarded. Requests that hit EOS or `max_new_tokens` have
    their Future resolved and their pages returned to the pool.
@@ -141,6 +142,10 @@ GPU runs are done under WSL. One command runs both engines, each in its own proc
 python -m benchmark --title "<architecture of this run>"
 bash benchmark/smoke_test.sh    # short check of the whole path
 ```
+
+The smoke script runs `ours`, `ours-fp8`, `vllm`, and `vllm-fp8` in separate processes,
+with 32 requests per configuration, four active slots, and a 256-token step budget.
+Graph compilation and capture still run at startup.
 
 Each run creates a folder:
 
@@ -175,6 +180,8 @@ so at most 32 requests run at once. `token_budget` must be above 128 and a multi
   except at `rate=inf`.
 - Latency is measured from the planned arrival. `send_lag` shows how late the client sent a
   request, and `ttft_engine` excludes it.
+  The vLLM adapter submits requests between synchronous `engine.step()` calls, so its
+  `send_lag` also includes time spent waiting for the current step to return.
 
 **Accuracy**: before serving, each prompt is generated once with HF (batch 1, greedy,
 `repetition_penalty=1.0`) and cached in `results/reference/<model>/`. Reports give the number of
@@ -406,8 +413,8 @@ and are marked as dirty.
 
 ### fp8 projections
 
-`build_model` (`model_loader.py`) loads the plain HF model and merges Q/K/V into one projection
-(`merge_qkv`, which drops the separate `q_proj`, `k_proj` and `v_proj`). With `quantization="fp8"`
+`build_model` (`model_loader.py`) loads the HF model. The serving path merges Q/K/V into one
+projection and uses paged Triton attention. With `quantization="fp8"`
 it then replaces the merged Q/K/V, `o_proj`, `gate_proj`, `up_proj` and `down_proj` with
 `Fp8Linear`. The largest input of each projection is recorded while generating from 16 calibration
 prompts that are separate from the benchmark prompts (`quant/calibration.py`). Input scales are

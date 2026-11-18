@@ -8,6 +8,7 @@ export TORCHINDUCTOR_CACHE_DIR="${TORCHINDUCTOR_CACHE_DIR:-$HOME/.cache/torchind
 
 "$PYTHON" -u -m benchmark \
     --title "smoke test" \
+    --engines ours ours-fp8 vllm vllm-fp8 \
     --kinds mixed short \
     --rates 8 inf \
     --repeats 2 \

@@ -111,7 +111,7 @@ def run_worker(engine: str, args: argparse.Namespace) -> None:
                 if isinstance(stats := getattr(init, field.name), ComponentInitStats)
             },
             "generation_seconds": seconds,
-            "preemptions": None if result.run is None else result.run.preemptions,
+            "preemptions": None if result.run is None else result.run.scheduler.preemptions,
             "answers": answers,
         }) + "\n")
 

@@ -51,13 +51,7 @@ class EagerMixedModule(MixedModule):
         self.metadata.write_slot_ids(slot_ids)
 
     def replay(self) -> torch.Tensor:
-        hidden = self._forward()
-        self.kv_cache.mixed_advance(
-            slot_ids=self.metadata.slot_ids,
-            lens=self.lens
-        )
-
-        return hidden
+        return self._forward()
 
 
 class EagerDecodeModule(DecodeModule):
@@ -252,6 +246,7 @@ def run_batch(
     )
     mixed.upload(prompts=chunks, slot_ids=slot_ids)
     hidden = mixed.replay()
+    kv.mixed_advance(slot_ids=mixed.metadata.slot_ids, lens=mixed.lens)
 
     offset = 0
     for (prompt, _), chunk, split, reference in zip(requests, chunks, splits, references):
