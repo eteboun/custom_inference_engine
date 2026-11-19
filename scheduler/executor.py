@@ -101,5 +101,6 @@ class CudaGraphExecutor:
             run_stats.piecewise_mixed_steps[module.token_count] += 1
 
         run_stats.tokens += token_count
+        run_stats.mixed_token_counts[token_count] += 1
         run_stats.bucket_tokens += module.token_count
         return module.forward(prompts=prompts, slot_ids=slot_ids)

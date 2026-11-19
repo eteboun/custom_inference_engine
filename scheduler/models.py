@@ -49,6 +49,7 @@ class InitStats:
 
 @dataclass
 class CudaGraphExecutorStats:
+    mixed_token_counts: Counter[int] = field(default_factory=Counter)
     batch_sizes: Counter[int] = field(default_factory=Counter)
     decode_steps: Counter[int] = field(default_factory=Counter)
     full_mixed_steps: Counter[tuple[int, int]] = field(default_factory=Counter)

@@ -142,6 +142,11 @@ def run_tables(run: GeneralStats) -> list[dict]:
             "rows": [[size, count] for size, count in sorted(executor.batch_sizes.items())],
         },
         {
+            "title": "Mixed steps by real token count",
+            "columns": ["tokens", "steps"],
+            "rows": sorted(executor.mixed_token_counts.items()),
+        },
+        {
             "title": "Scheduler counters",
             "columns": ["mixed tokens", "mixed bucket tokens", "preemptions", "recomputed tokens"],
             "rows": [[executor.tokens, executor.bucket_tokens, scheduler.preemptions, scheduler.recomputed_tokens]],
