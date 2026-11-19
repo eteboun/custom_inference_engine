@@ -161,6 +161,10 @@ Main arguments: `--title` (required), `--model` (`Qwen/Qwen2.5-0.5B-Instruct`), 
 calibrated input scales, see fp8 projections below) and `vllm-fp8` (vLLM with
 `quantization="fp8_per_tensor"`).
 
+Use `--vllm-gpu-memory-utilization` and `--vllm-max-model-len` to override the vLLM memory
+budget and sequence length limit. For example, the Qwen2.5-1.5B-Instruct check on an 8 GiB GPU
+used `--vllm-gpu-memory-utilization 0.7 --vllm-max-model-len 2048`.
+
 `n_slots` can be at most one more than the largest bucket (32); slot 0 is the padding slot,
 so at most 32 requests run at once. `token_budget` must be above 128 and a multiple of 32.
 
@@ -184,6 +188,16 @@ requests identical to the reference (`exact`) and the mean share of tokens match
 first difference (`match ratio`), using every request; trailing EOS tokens are ignored. The
 reference also runs in fp16.
 
+The custom engine's **Mixed steps by real token count** table shows how many mixed steps
+processed each token count before bucket padding.
+
+### Terminal chat
+
+Run `python chat.py` to chat with the custom engine. Add `--fp8` to use fp8 projections
+or `--max-new-tokens` to change the response limit (128 by default). The model and CUDA graphs
+are prepared at startup. Each turn reuses the conversation history as part of the next prompt.
+Type `/reset` to clear it or `/exit` to quit.
+
 ### Feature benchmarks (`feature_bench/`)
 
 Each benchmark writes a JSON and an HTML report to the `results/` folder of its feature:
@@ -203,6 +217,9 @@ python -m feature_bench.fp8.gsm8k --title "<what this run tests>" --engines ours
   compares the logits.
 - `step_time`: times `replay()` of both modules for each batch size and token count, with one
   process per token count to keep memory use low.
+  Use `--model` to choose the checkpoint. `--token-counts` specifies real input tokens.
+  `--full-bucket` fixes the full graph bucket size, and `--piecewise-bucket-step` rounds
+  piecewise buckets up to the given multiple. By default both bucket sizes match the input size.
 - `full_graph_token_jump`: compares exactly two token counts on `FullMixedModule` for each batch size,
   with one process per token count: `replay()` time as in `step_time`, then kernel times from
   `torch.profiler`.
@@ -249,8 +266,9 @@ the mean of 3 repeats; times are in ms. Full results for every configuration are
   ranges of the 3 repeats do not overlap.
 - At rates 4 and 8, throughput equals the offered load on both engines. Ours has lower tpot
   (about 15-20%) and e2e (about 15-25%).
-- `send_lag` p99 at rates 4 and 8 is about 2 ms for ours and 13-30 ms for vLLM. TTFT measured
-  from the actual submission (`ttft_engine`) also differs: 10.2 | 28.1 ms on `short` at rate 4.
+- With the synchronous vLLM adapter used for this run, `send_lag` p99 at rates 4 and 8 was
+  about 2 ms for ours and 13-30 ms for vLLM. TTFT from actual submission (`ttft_engine`) was
+  10.2 | 28.1 ms on `short` at rate 4.
 - Both engines match the HF reference on about 84-89% of requests, with no consistent winner
   except `short` at `inf`.
 - There were no preemptions. Step counts per backend are in the report.
