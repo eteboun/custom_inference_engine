@@ -74,38 +74,50 @@ class OursServer:
 class VllmServer:
 
     def __init__(self, args: argparse.Namespace, eos_token_ids: set[int], quantization: str | None) -> None:
-        from vllm_baseline.vllm_generate import build_vllm_engine
+        from vllm_baseline.vllm_serve import build_async_vllm_engine
 
+        overrides = {}
+        memory_utilization = getattr(args, "vllm_gpu_memory_utilization", None)
+        max_model_len = getattr(args, "vllm_max_model_len", None)
+        if memory_utilization is not None:
+            overrides["gpu_memory_utilization"] = memory_utilization
+        if max_model_len is not None:
+            overrides["max_model_len"] = max_model_len
         start = time.perf_counter()
-        self.engine = build_vllm_engine(
+        self.engine = build_async_vllm_engine(
             model=args.model,
             max_num_seqs=args.n_slots - 1,
             max_num_batched_tokens=args.token_budget,
-            quantization=quantization
+            quantization=quantization,
+            **overrides,
         )
         self.init = InitStats(total_seconds=time.perf_counter() - start)
 
         self.eos_token_ids = eos_token_ids
         self.max_new_tokens: int = args.max_new_tokens
         self.n_runs = 0
+        self.runner = asyncio.Runner()
 
     def serve(self, requests: list[list[int]], arrivals: list[float]) -> ServeResult:
         from vllm_baseline.vllm_serve import serve_vllm
 
-        output = serve_vllm(
+        output = self.runner.run(serve_vllm(
             engine=self.engine,
             requests=requests,
             arrivals=arrivals,
             eos_token_ids=self.eos_token_ids,
             max_new_tokens=self.max_new_tokens,
             tag=str(self.n_runs)
-        )
+        ))
         self.n_runs += 1
 
         return ServeResult(output=output, init=self.init)
 
     def close(self) -> None:
-        pass
+        try:
+            self.engine.shutdown()
+        finally:
+            self.runner.close()
 
 
 def build_server(engine: str, args: argparse.Namespace, eos_token_ids: set[int]) -> Server:

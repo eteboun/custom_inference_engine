@@ -176,8 +176,7 @@ so at most 32 requests run at once. `token_budget` must be above 128 and a multi
   except at `rate=inf`.
 - Latency is measured from the planned arrival. `send_lag` shows how late the client sent a
   request, and `ttft_engine` excludes it.
-  The vLLM adapter submits requests between synchronous `engine.step()` calls, so its
-  `send_lag` also includes time spent waiting for the current step to return.
+  The vLLM adapter submits requests through `AsyncLLM` and reads streamed token outputs.
 
 **Accuracy**: before serving, each prompt is generated once with HF (batch 1, greedy,
 `repetition_penalty=1.0`) and cached in `results/reference/<model>/`. Reports give the number of

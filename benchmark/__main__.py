@@ -32,6 +32,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--n-slots", type=int, default=33)
     parser.add_argument("--page-size", type=int, default=16)
     parser.add_argument("--token-budget", type=int, default=1024)
+    parser.add_argument("--vllm-gpu-memory-utilization", type=float)
+    parser.add_argument("--vllm-max-model-len", type=int)
     parser.add_argument("--worker-engine", choices=ENGINES, default=None)
     parser.add_argument("--run-dir", type=Path, default=None)
     return parser.parse_args()
@@ -83,6 +85,10 @@ def run_engine(args: argparse.Namespace) -> None:
         "prompt_seed": args.seed,
         "quantization": QUANTIZATION.get(engine),
     }
+
+    if engine.startswith("vllm"):
+        settings["vllm_gpu_memory_utilization"] = args.vllm_gpu_memory_utilization
+        settings["vllm_max_model_len"] = args.vllm_max_model_len
 
     configs = list(itertools.product(range(args.repeats), args.kinds, args.rates))
     random.Random(args.seed).shuffle(configs)

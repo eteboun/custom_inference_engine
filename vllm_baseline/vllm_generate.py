@@ -14,17 +14,21 @@ _vllm_engine = None
 _vllm_request_ids = itertools.count()
 
 
-def build_vllm_engine(**overrides):
+def vllm_engine_options(**overrides):
     os.environ.setdefault("VLLM_USE_FLASHINFER_SAMPLER", "0")
-    from vllm import LLMEngine, EngineArgs
-
-    engine = LLMEngine.from_engine_args(EngineArgs(**{
+    return {
         "model": MODEL_ID,
         "dtype": "float16",
         "gpu_memory_utilization": VLLM_GPU_MEMORY_UTILIZATION,
         "enable_prefix_caching": False,
         **overrides,
-    }))
+    }
+
+
+def build_vllm_engine(**overrides):
+    from vllm import LLMEngine, EngineArgs
+
+    engine = LLMEngine.from_engine_args(EngineArgs(**vllm_engine_options(**overrides)))
     atexit.register(engine.engine_core.shutdown)
     return engine
 
